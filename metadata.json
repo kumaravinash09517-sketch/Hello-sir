@@ -1,0 +1,6 @@
+{
+  "name": "Hello Sir",
+  "description": "Real-time global chat app with active user presence, direct and broadcast messaging, and live notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,30 @@
+<resources>
+    <string name="app_name">Hello Sir</string>
+    <string name="tagline">Global conversations, live presence</string>
+    <string name="login_headline">Join the global room</string>
+    <string name="login_subtitle">Enter your display name and a unique User ID to connect with active members.</string>
+    <string name="label_name">Your Name</string>
+    <string name="placeholder_name">e.g. Aarav Sharma</string>
+    <string name="label_user_id">Unique User ID</string>
+    <string name="placeholder_user_id">e.g. aarav_01</string>
+    <string name="action_join_chat">Connect &amp; Enter</string>
+    <string name="action_sign_out">Sign Out</string>
+    <string name="action_refresh">Refresh</string>
+    <string name="action_send">Send message</string>
+    <string name="title_active_users">People</string>
+    <string name="title_global_broadcast">Global Broadcast</string>
+    <string name="subtitle_global_broadcast">Message everyone in Hello Sir</string>
+    <string name="status_online">Online</string>
+    <string name="status_offline">Offline</string>
+    <string name="error_blocked">You are blocked by the administrator.</string>
+    <string name="blocked_dialog_title">Access Restricted</string>
+    <string name="blocked_dialog_action">Dismiss</string>
+    <string name="notification_channel_name">Incoming Messages</string>
+    <string name="notification_channel_desc">Alerts when new direct or global messages arrive in Hello Sir</string>
+    <string name="cd_back">Navigate back</string>
+    <string name="cd_refresh">Refresh users and messages</string>
+    <string name="cd_sign_out">Sign out</string>
+    <string name="cd_send">Send message</string>
+    <string name="cd_notifications">Notification settings</string>
+    <string name="cd_hero_banner">Hello Sir global chat illustration</string>
+</resources>
