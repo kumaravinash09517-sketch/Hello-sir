@@ -21,12 +21,12 @@ jobs:
     - name: Install Gradle
       uses: gradle/actions/setup-gradle@v3
 
-    - name: Create Dummy google-services.json to prevent error
+    - name: Remove google-services plugin constraint
       run: |
-        echo '{}' > app/google-services.json
+        rm -f app/google-services.json
 
     - name: Build APK with System Gradle
-      run: gradle assembleDebug -x lint
+      run: gradle assembleDebug -x lint -Pcom.google.gms.google-services.disabled=true
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
