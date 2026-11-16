@@ -21,9 +21,10 @@ jobs:
     - name: Install Gradle
       uses: gradle/actions/setup-gradle@v3
 
-    - name: Remove google-services plugin constraint
+    - name: Remove google-services plugin constraint & Generate Keystore
       run: |
         rm -f app/google-services.json
+        keytool -genkey -v -keystore debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -passin pass:android -passout pass:android || true
 
     - name: Build APK with System Gradle
       run: gradle assembleDebug -x lint -Pcom.google.gms.google-services.disabled=true
