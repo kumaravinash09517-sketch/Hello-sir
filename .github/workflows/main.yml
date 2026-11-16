@@ -24,7 +24,6 @@ jobs:
     - name: Remove google-services constraint & Bypass signing check
       run: |
         rm -f app/google-services.json
-        # Bypass debug keystore validation if missing in build.gradle
         find . -name "build.gradle*" -exec sed -i '/signingConfig /d' {} + || true
 
     - name: Build APK with System Gradle
@@ -33,5 +32,7 @@ jobs:
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: app-debug-apk
-        path: app/build/outputs/apk/debug/app-debug-apk.apk
+        name: hello-sir-debug
+        path: |
+          app/build/outputs/apk/debug/*.apk
+          build/outputs/apk/debug/*.apk
