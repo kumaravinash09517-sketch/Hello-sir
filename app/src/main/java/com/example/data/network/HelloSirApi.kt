@@ -9,16 +9,18 @@ import retrofit2.Retrofit
 import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.POST
+import retrofit2.http.Path
 import java.util.concurrent.TimeUnit
 
 interface HelloSirApi {
-    @POST("register")
+    // पाइथन सर्वर के असली राउट्स के हिसाब से इन्हें अपडेट कर दिया गया है
+    @POST("api/users/register")
     suspend fun register(@Body body: RequestBody): Response<ResponseBody>
 
-    @GET("get")
+    @GET("api/users")
     suspend fun getFeed(): Response<ResponseBody>
 
-    @POST("send")
+    @POST("api/messages")
     suspend fun sendMessage(@Body body: RequestBody): Response<ResponseBody>
 }
 
