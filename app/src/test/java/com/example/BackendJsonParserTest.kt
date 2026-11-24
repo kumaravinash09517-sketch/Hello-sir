@@ -1,8 +1,16 @@
 package com.example
 
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
+import com.example.data.SessionManager
 import com.example.data.model.BROADCAST_TARGET_ID
 import com.example.data.model.ChatUser
+import com.example.data.model.LocationPayload
+import com.example.data.model.MediaPayload
+import com.example.data.model.MessageKind
+import com.example.data.model.SignalingEnvelope
 import com.example.data.network.BackendJsonParser
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -46,25 +54,69 @@ class BackendJsonParserTest {
     }
 
     @Test
-    fun parseFeed_handlesFlatUserMapAndIsoTimestamps() {
+    fun parseFeed_separatesWebRtcSignalsLocationAndMediaFromText() {
+        val signalText = BackendJsonParser.encodeSignal(
+            SignalingEnvelope(
+                signalId = "sig_1",
+                type = "offer",
+                sender = "bob",
+                receiver = "alice",
+                sdp = "v=0...",
+                isVideo = true
+            )
+        ).replace("\"", "\\\"")
+
+        val locText = BackendJsonParser.encodeLocation(
+            LocationPayload(latitude = 28.6139, longitude = 77.2090, isLive = true)
+        ).replace("\"", "\\\"")
+
+        val mediaText = BackendJsonParser.encodeMedia(
+            MediaPayload(
+                kind = MessageKind.DOCUMENT,
+                displayName = "spec.pdf",
+                mimeType = "application/pdf",
+                sizeBytes = 4096L
+            )
+        ).replace("\"", "\\\"")
+
+        val nowSec = System.currentTimeMillis() / 1000L
         val json = """
             {
-              "users": {
-                "u_10": {"name": "Zoya", "online": true, "last_seen": "2026-11-16T03:00:00Z"},
-                "u_20": {"name": "Rohan", "online": false}
-              },
-              "chats": [
-                {"sender": "u_10", "receiver": "u_20", "message": "Ping", "created_at": "2026-11-16T03:01:00.000Z"}
+              "users": [],
+              "messages": [
+                {"id": "s1", "sender": "bob", "receiver": "alice", "text": "$signalText", "timestamp": $nowSec},
+                {"id": "m1", "sender": "bob", "receiver": "alice", "text": "$locText", "timestamp": $nowSec},
+                {"id": "m2", "sender": "alice", "receiver": "bob", "text": "$mediaText", "timestamp": $nowSec}
               ]
             }
         """.trimIndent()
 
         val feed = BackendJsonParser.parseFeed(json)
-        assertEquals(2, feed.users.size)
-        assertEquals(1, feed.messages.size)
-        assertTrue(feed.users.first { it.userId == "u_10" }.isOnline())
-        assertFalse(feed.users.first { it.userId == "u_20" }.isOnline())
-        assertEquals("Ping", feed.messages.first().text)
+        assertEquals(1, feed.signals.size)
+        assertEquals("offer", feed.signals.first().type)
+        assertTrue(feed.signals.first().isVideo)
+
+        assertEquals(2, feed.messages.size)
+        assertEquals(MessageKind.LOCATION, feed.messages[0].kind)
+        assertEquals(28.6139, feed.messages[0].location!!.latitude, 0.0001)
+        assertEquals(MessageKind.DOCUMENT, feed.messages[1].kind)
+        assertEquals("spec.pdf", feed.messages[1].media!!.displayName)
+    }
+
+    @Test
+    fun sessionManager_enforcesSingleDeviceLockAndReset() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val manager = SessionManager(context)
+        manager.resetSessionLock()
+        assertFalse(manager.isDeviceLocked())
+
+        val locked = manager.lockSession("aarav_01", "Aarav")
+        assertTrue(manager.isDeviceLocked())
+        assertEquals("aarav_01", locked.userId)
+        assertTrue(locked.deviceLockId.startsWith("DEV-"))
+
+        manager.resetSessionLock()
+        assertFalse(manager.isDeviceLocked())
     }
 
     @Test

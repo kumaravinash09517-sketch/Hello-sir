@@ -1,8 +1,10 @@
 package com.example.ui.screens
 
+import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -24,8 +26,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
-import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.Campaign
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.NotificationsOff
@@ -55,14 +55,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.BROADCAST_TARGET_ID
+import com.example.data.model.ChatMessage
 import com.example.data.model.ChatUser
+import com.example.data.model.MessageKind
 import com.example.ui.ChatUiState
 import com.example.ui.components.PresenceBadge
 import com.example.ui.components.UserAvatar
@@ -73,11 +77,16 @@ fun HomeScreen(
     uiState: ChatUiState,
     notificationsEnabled: Boolean,
     onRequestNotifications: () -> Unit,
+    onOpenProfileSettings: () -> Unit,
     onRefresh: () -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSelectTarget: (String?) -> Unit,
     onSendMessage: (receiver: String, text: String, onSent: () -> Unit) -> Unit,
-    onSignOut: () -> Unit,
+    onSendLocation: (receiver: String, live: Boolean) -> Unit,
+    onStopLiveLocation: () -> Unit,
+    onSendMedia: (receiver: String, uri: Uri, kind: MessageKind?) -> Unit,
+    onStartCall: (targetUserId: String, targetUserName: String, isVideo: Boolean) -> Unit,
+    onDeleteMessage: (ChatMessage) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val currentSession = uiState.session ?: return
@@ -93,10 +102,10 @@ fun HomeScreen(
                     currentUserName = currentSession.name,
                     notificationsEnabled = notificationsEnabled,
                     onRequestNotifications = onRequestNotifications,
+                    onOpenProfileSettings = onOpenProfileSettings,
                     onRefresh = onRefresh,
                     onSearchQueryChange = onSearchQueryChange,
                     onSelectTarget = { onSelectTarget(it) },
-                    onSignOut = onSignOut,
                     modifier = Modifier
                         .width(360.dp)
                         .fillMaxHeight()
@@ -113,10 +122,17 @@ fun HomeScreen(
                     users = uiState.users,
                     messages = uiState.messagesForTarget(activeTarget),
                     isSending = uiState.isSending,
+                    isFetchingLocation = uiState.isFetchingLocation,
+                    isLiveLocationSharing = uiState.isLiveLocationSharing,
                     showBackButton = false,
                     onBack = { onSelectTarget(null) },
                     onSelectTarget = { onSelectTarget(it) },
                     onSendMessage = onSendMessage,
+                    onSendLocation = onSendLocation,
+                    onStopLiveLocation = onStopLiveLocation,
+                    onSendMedia = onSendMedia,
+                    onStartCall = onStartCall,
+                    onDeleteMessage = onDeleteMessage,
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -129,10 +145,17 @@ fun HomeScreen(
                     users = uiState.users,
                     messages = uiState.messagesForTarget(activeTarget),
                     isSending = uiState.isSending,
+                    isFetchingLocation = uiState.isFetchingLocation,
+                    isLiveLocationSharing = uiState.isLiveLocationSharing,
                     showBackButton = true,
                     onBack = { onSelectTarget(null) },
                     onSelectTarget = { onSelectTarget(it) },
-                    onSendMessage = onSendMessage
+                    onSendMessage = onSendMessage,
+                    onSendLocation = onSendLocation,
+                    onStopLiveLocation = onStopLiveLocation,
+                    onSendMedia = onSendMedia,
+                    onStartCall = onStartCall,
+                    onDeleteMessage = onDeleteMessage
                 )
             } else {
                 UserDirectoryPane(
@@ -141,10 +164,10 @@ fun HomeScreen(
                     currentUserName = currentSession.name,
                     notificationsEnabled = notificationsEnabled,
                     onRequestNotifications = onRequestNotifications,
+                    onOpenProfileSettings = onOpenProfileSettings,
                     onRefresh = onRefresh,
                     onSearchQueryChange = onSearchQueryChange,
                     onSelectTarget = { onSelectTarget(it) },
-                    onSignOut = onSignOut,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -160,13 +183,14 @@ private fun UserDirectoryPane(
     currentUserName: String,
     notificationsEnabled: Boolean,
     onRequestNotifications: () -> Unit,
+    onOpenProfileSettings: () -> Unit,
     onRefresh: () -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSelectTarget: (String) -> Unit,
-    onSignOut: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val broadcastPreview = uiState.latestPreviewForTarget(BROADCAST_TARGET_ID)
+    val broadcastUnread = uiState.unreadCountForTarget(BROADCAST_TARGET_ID)
 
     Scaffold(
         modifier = modifier,
@@ -178,19 +202,46 @@ private fun UserDirectoryPane(
                     containerColor = MaterialTheme.colorScheme.surfaceContainerLow
                 ),
                 title = {
-                    Column {
-                        Text(
-                            text = stringResource(R.string.app_name),
-                            style = MaterialTheme.typography.titleLarge,
-                            color = MaterialTheme.colorScheme.primary
+                    // Tapping your own avatar/identity discreetly opens hidden Profile & Device Settings (with Logout)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = stringResource(R.string.cd_profile),
+                                onClick = onOpenProfileSettings
+                            )
+                            .padding(horizontal = 4.dp, vertical = 4.dp)
+                            .testTag("profile_settings_trigger")
+                    ) {
+                        val initials = currentUserName.trim().split(Regex("\\s+"))
+                            .filter { it.isNotEmpty() }
+                            .take(2)
+                            .joinToString("") { it.first().uppercaseChar().toString() }
+                            .ifBlank { currentUserId.take(2).uppercase() }
+
+                        UserAvatar(
+                            initials = initials,
+                            isOnline = true,
+                            seedKey = currentUserId,
+                            size = 38.dp
                         )
-                        Text(
-                            text = "$currentUserName (@$currentUserId)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        Column {
+                            Text(
+                                text = stringResource(R.string.app_name),
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "$currentUserName (@$currentUserId)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 },
                 actions = {
@@ -225,17 +276,6 @@ private fun UserDirectoryPane(
                             contentDescription = stringResource(R.string.cd_refresh)
                         )
                     }
-                    IconButton(
-                        onClick = onSignOut,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("sign_out_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Rounded.Logout,
-                            contentDescription = stringResource(R.string.cd_sign_out)
-                        )
-                    }
                 }
             )
         }
@@ -244,7 +284,6 @@ private fun UserDirectoryPane(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .navigationBarsPadding()
         ) {
             if (uiState.isRefreshing) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -276,7 +315,6 @@ private fun UserDirectoryPane(
                 }
             }
 
-            // Presence summary & Search bar
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -320,7 +358,7 @@ private fun UserDirectoryPane(
                 OutlinedTextField(
                     value = uiState.searchQuery,
                     onValueChange = onSearchQueryChange,
-                    placeholder = { Text("Search users by name or ID…") },
+                    placeholder = { Text("Search users by name or @userId…") },
                     leadingIcon = {
                         Icon(
                             imageVector = Icons.Rounded.Search,
@@ -349,13 +387,15 @@ private fun UserDirectoryPane(
                 item(key = "global_broadcast") {
                     GlobalBroadcastCard(
                         selected = uiState.selectedTargetId == BROADCAST_TARGET_ID,
-                        latestText = broadcastPreview?.let { "${it.sender}: ${it.text}" }
+                        latestText = broadcastPreview?.let { "${it.sender}: ${it.previewSummary()}" }
                             ?: stringResource(R.string.subtitle_global_broadcast),
+                        latestTime = broadcastPreview?.formattedTime().orEmpty(),
+                        unreadCount = broadcastUnread,
                         onClick = { onSelectTarget(BROADCAST_TARGET_ID) }
                     )
                 }
 
-                if (uiState.filteredUsers.isEmpty()) {
+                if (uiState.sortedChatUsers.isEmpty()) {
                     item(key = "empty_users") {
                         EmptyUsersPlaceholder(
                             hasSearch = uiState.searchQuery.isNotBlank(),
@@ -364,16 +404,19 @@ private fun UserDirectoryPane(
                     }
                 } else {
                     items(
-                        items = uiState.filteredUsers,
+                        items = uiState.sortedChatUsers,
                         key = { it.userId }
                     ) { user ->
                         val isMe = user.userId.equals(currentUserId, ignoreCase = true)
                         val latestMsg = uiState.latestPreviewForTarget(user.userId)
+                        val unreadCount = uiState.unreadCountForTarget(user.userId)
                         UserRowCard(
                             user = user,
                             isMe = isMe,
                             isSelected = uiState.selectedTargetId.equals(user.userId, ignoreCase = true),
-                            previewText = latestMsg?.text,
+                            previewText = latestMsg?.previewSummary(),
+                            latestTime = latestMsg?.formattedTime().orEmpty(),
+                            unreadCount = unreadCount,
                             onClick = { onSelectTarget(user.userId) }
                         )
                     }
@@ -387,6 +430,8 @@ private fun UserDirectoryPane(
 private fun GlobalBroadcastCard(
     selected: Boolean,
     latestText: String,
+    latestTime: String,
+    unreadCount: Int,
     onClick: () -> Unit
 ) {
     val gradientBrush = Brush.horizontalGradient(
@@ -443,11 +488,21 @@ private fun GlobalBroadcastCard(
                     overflow = TextOverflow.Ellipsis
                 )
             }
-            Icon(
-                imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onPrimaryContainer
-            )
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                if (latestTime.isNotEmpty()) {
+                    Text(
+                        text = latestTime,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.75f)
+                    )
+                }
+                if (unreadCount > 0) {
+                    UnreadBadge(count = unreadCount)
+                }
+            }
         }
     }
 }
@@ -458,6 +513,8 @@ private fun UserRowCard(
     isMe: Boolean,
     isSelected: Boolean,
     previewText: String?,
+    latestTime: String,
+    unreadCount: Int,
     onClick: () -> Unit
 ) {
     val isOnline = user.isOnline()
@@ -487,7 +544,8 @@ private fun UserRowCard(
                 initials = user.initials,
                 isOnline = isOnline,
                 seedKey = user.userId,
-                size = 48.dp
+                size = 48.dp,
+                avatarUrl = user.avatarUrl
             )
 
             Column(modifier = Modifier.weight(1f)) {
@@ -513,16 +571,55 @@ private fun UserRowCard(
                 Text(
                     text = previewText ?: "@${user.userId}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (unreadCount > 0) {
+                        MaterialTheme.colorScheme.onSurface
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    fontWeight = if (unreadCount > 0) FontWeight.SemiBold else FontWeight.Normal,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
             }
 
-            Icon(
-                imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                if (latestTime.isNotEmpty()) {
+                    Text(
+                        text = latestTime,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (unreadCount > 0) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
+                }
+                if (unreadCount > 0) {
+                    UnreadBadge(count = unreadCount)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UnreadBadge(count: Int) {
+    Surface(
+        shape = CircleShape,
+        color = Color(0xFFEF4444),
+        modifier = Modifier
+            .size(22.dp)
+            .testTag("unread_badge")
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = if (count > 99) "99+" else count.toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White,
+                fontWeight = FontWeight.Bold
             )
         }
     }

@@ -1,14 +1,27 @@
 package com.example.ui
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.ChatRepository
+import com.example.data.model.ActivityNotification
 import com.example.data.model.BROADCAST_TARGET_ID
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatUser
+import com.example.data.model.MessageKind
 import com.example.data.model.NetworkResult
+import com.example.data.model.SocialComment
+import com.example.data.model.SocialMediaType
+import com.example.data.model.SocialPost
+import com.example.data.model.UserProfileExtras
 import com.example.data.model.UserSession
+import com.example.webrtc.CallStatus
+import com.example.webrtc.CallUiState
+import com.example.webrtc.SignalingTransportState
+import com.example.webrtc.WebRTCClient
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -20,24 +33,73 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+enum class AppTab {
+    FEED,
+    REELS,
+    EXPLORE,
+    CHATS,
+    PROFILE
+}
+
 data class ChatUiState(
     val session: UserSession? = null,
+    val activeTab: AppTab = AppTab.FEED,
     val users: List<ChatUser> = emptyList(),
     val messages: List<ChatMessage> = emptyList(),
+    val threadReads: Map<String, Long> = emptyMap(),
+    val socialPosts: List<SocialPost> = emptyList(),
+    val socialComments: Map<String, List<SocialComment>> = emptyMap(),
+    val profileExtras: Map<String, UserProfileExtras> = emptyMap(),
+    val activityNotifications: List<ActivityNotification> = emptyList(),
     val searchQuery: String = "",
+    val exploreQuery: String = "",
     val selectedTargetId: String? = null,
+    val viewedProfileUserId: String? = null,
+    val showActivityFeed: Boolean = false,
+    val showProfileSettings: Boolean = false,
+    val isCallScreenMinimized: Boolean = false,
     val isRegistering: Boolean = false,
     val isRefreshing: Boolean = false,
     val isSending: Boolean = false,
+    val isFetchingLocation: Boolean = false,
+    val isLiveLocationSharing: Boolean = false,
     val registerError: String? = null,
     val sendError: String? = null,
     val syncError: String? = null,
     val lastSyncMs: Long? = null,
-    val blockedAlertMessage: String? = null
+    val blockedAlertMessage: String? = null,
+    val callState: CallUiState = CallUiState(),
+    val signalingTransportState: SignalingTransportState = SignalingTransportState.DISCONNECTED
 ) {
-    val filteredUsers: List<ChatUser>
+    /**
+     * Sorts chat users so active conversations with the newest messages bubble to the top,
+     * preserving online priority and alphabetical fallback.
+     */
+    val sortedChatUsers: List<ChatUser>
         get() {
-            val q = searchQuery.trim()
+            val now = System.currentTimeMillis()
+            val q = searchQuery.trim().removePrefix("@")
+            val filtered = if (q.isEmpty()) {
+                users
+            } else {
+                users.filter {
+                    it.name.contains(q, ignoreCase = true) ||
+                        it.userId.contains(q, ignoreCase = true)
+                }
+            }
+            return filtered.sortedWith(
+                compareByDescending<ChatUser> { latestPreviewForTarget(it.userId)?.timestampMs ?: 0L }
+                    .thenByDescending { it.isOnline(now) }
+                    .thenBy { it.name.lowercase() }
+            )
+        }
+
+    /**
+     * Supports Explore search by Name, Username, or @UserID (case-insensitive, @-prefix supported).
+     */
+    val exploredUsers: List<ChatUser>
+        get() {
+            val q = exploreQuery.trim().removePrefix("@")
             if (q.isEmpty()) return users
             return users.filter {
                 it.name.contains(q, ignoreCase = true) ||
@@ -45,8 +107,42 @@ data class ChatUiState(
             }
         }
 
+    val exploredPosts: List<SocialPost>
+        get() {
+            val q = exploreQuery.trim().removePrefix("@")
+            if (q.isEmpty()) return socialPosts
+            return socialPosts.filter {
+                it.caption.contains(q, ignoreCase = true) ||
+                    it.authorName.contains(q, ignoreCase = true) ||
+                    it.authorId.contains(q, ignoreCase = true) ||
+                    it.shayariTag.contains(q, ignoreCase = true)
+            }
+        }
+
+    val reelsPosts: List<SocialPost>
+        get() = socialPosts.filter { it.mediaType == SocialMediaType.REEL }
+
+    val totalUnreadMessages: Int
+        get() {
+            val broadcastUnread = unreadCountForTarget(BROADCAST_TARGET_ID)
+            val userUnread = users.sumOf { unreadCountForTarget(it.userId) }
+            return broadcastUnread + userUnread
+        }
+
+    val unreadActivityCount: Int
+        get() = activityNotifications.count { !it.isRead }
+
     val onlineCount: Int
         get() = users.count { it.isOnline() }
+
+    fun unreadCountForTarget(targetId: String): Int {
+        val me = session?.userId ?: return 0
+        if (activeTab == AppTab.CHATS && selectedTargetId.equals(targetId, ignoreCase = true)) return 0
+        val lastRead = threadReads[targetId] ?: 0L
+        return messagesForTarget(targetId).count { msg ->
+            !msg.sender.equals(me, ignoreCase = true) && msg.timestampMs > lastRead
+        }
+    }
 
     fun messagesForTarget(targetId: String): List<ChatMessage> {
         val me = session?.userId ?: return emptyList()
@@ -67,11 +163,18 @@ data class ChatUiState(
 }
 
 private data class LocalUiFlags(
+    val activeTab: AppTab = AppTab.FEED,
     val searchQuery: String = "",
+    val exploreQuery: String = "",
     val selectedTargetId: String? = null,
+    val viewedProfileUserId: String? = null,
+    val showActivityFeed: Boolean = false,
+    val showProfileSettings: Boolean = false,
+    val isCallScreenMinimized: Boolean = false,
     val isRegistering: Boolean = false,
     val isRefreshing: Boolean = false,
     val isSending: Boolean = false,
+    val isFetchingLocation: Boolean = false,
     val registerError: String? = null,
     val sendError: String? = null,
     val blockedAlertMessage: String? = null
@@ -80,42 +183,75 @@ private data class LocalUiFlags(
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = ChatRepository.getInstance(application)
-    private val localFlags = MutableStateFlow(LocalUiFlags())
+    val webRTCClient: WebRTCClient = repository.webRTCClient
 
-    private val _toastEvents = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    private val localFlags = MutableStateFlow(LocalUiFlags())
+    private var remoteSearchJob: Job? = null
+
+    private val _toastEvents = MutableSharedFlow<String>(extraBufferCapacity = 6)
     val toastEvents: SharedFlow<String> = _toastEvents.asSharedFlow()
 
+    @Suppress("UNCHECKED_CAST")
     val uiState: StateFlow<ChatUiState> = combine(
         repository.session,
         repository.users,
         repository.messages,
+        repository.threadReads,
+        repository.socialPosts,
+        repository.socialComments,
+        repository.profileExtras,
+        repository.activityNotifications,
         repository.syncError,
         repository.lastSyncMs,
+        repository.callState,
+        repository.signalingTransportState,
+        repository.isLiveLocationSharing,
         localFlags
     ) { values ->
         val session = values[0] as UserSession?
-        @Suppress("UNCHECKED_CAST")
         val users = values[1] as List<ChatUser>
-        @Suppress("UNCHECKED_CAST")
         val messages = values[2] as List<ChatMessage>
-        val syncError = values[3] as String?
-        val lastSyncMs = values[4] as Long?
-        val flags = values[5] as LocalUiFlags
+        val threadReads = values[3] as Map<String, Long>
+        val posts = values[4] as List<SocialPost>
+        val comments = values[5] as Map<String, List<SocialComment>>
+        val extras = values[6] as Map<String, UserProfileExtras>
+        val activities = values[7] as List<ActivityNotification>
+        val syncError = values[8] as String?
+        val lastSyncMs = values[9] as Long?
+        val callState = values[10] as CallUiState
+        val transport = values[11] as SignalingTransportState
+        val isLiveLoc = values[12] as Boolean
+        val flags = values[13] as LocalUiFlags
 
         ChatUiState(
             session = session,
+            activeTab = flags.activeTab,
             users = users,
             messages = messages,
+            threadReads = threadReads,
+            socialPosts = posts,
+            socialComments = comments,
+            profileExtras = extras,
+            activityNotifications = activities,
             searchQuery = flags.searchQuery,
+            exploreQuery = flags.exploreQuery,
             selectedTargetId = flags.selectedTargetId,
+            viewedProfileUserId = flags.viewedProfileUserId,
+            showActivityFeed = flags.showActivityFeed,
+            showProfileSettings = flags.showProfileSettings,
+            isCallScreenMinimized = if (callState.isActive) flags.isCallScreenMinimized else false,
             isRegistering = flags.isRegistering,
             isRefreshing = flags.isRefreshing,
             isSending = flags.isSending,
+            isFetchingLocation = flags.isFetchingLocation,
+            isLiveLocationSharing = isLiveLoc,
             registerError = flags.registerError,
             sendError = flags.sendError,
             syncError = syncError,
             lastSyncMs = lastSyncMs,
-            blockedAlertMessage = flags.blockedAlertMessage
+            blockedAlertMessage = flags.blockedAlertMessage,
+            callState = callState,
+            signalingTransportState = transport
         )
     }.stateIn(
         scope = viewModelScope,
@@ -130,25 +266,72 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 _toastEvents.tryEmit(msg)
             }
         }
+        viewModelScope.launch {
+            repository.callState.collect { call ->
+                if (call.status == CallStatus.INCOMING_RINGING || call.status == CallStatus.OUTGOING_RINGING) {
+                    localFlags.update { it.copy(isCallScreenMinimized = false) }
+                }
+            }
+        }
     }
 
-    fun register(userId: String, name: String) {
+    fun selectTab(tab: AppTab) {
+        localFlags.update {
+            it.copy(
+                activeTab = tab,
+                showActivityFeed = false,
+                showProfileSettings = false,
+                viewedProfileUserId = if (tab == AppTab.PROFILE) it.viewedProfileUserId else null
+            )
+        }
+    }
+
+    fun openUserProfile(userId: String) {
+        localFlags.update {
+            it.copy(
+                activeTab = AppTab.PROFILE,
+                viewedProfileUserId = userId,
+                showActivityFeed = false,
+                showProfileSettings = false
+            )
+        }
+    }
+
+    fun openActivityFeed() {
+        localFlags.update { it.copy(showActivityFeed = true, showProfileSettings = false) }
+        viewModelScope.launch { repository.markAllActivityRead() }
+    }
+
+    fun closeActivityFeed() {
+        localFlags.update { it.copy(showActivityFeed = false) }
+    }
+
+    fun minimizeCallScreen() {
+        localFlags.update { it.copy(isCallScreenMinimized = true) }
+    }
+
+    fun reopenCallScreen() {
+        localFlags.update { it.copy(isCallScreenMinimized = false) }
+    }
+
+    fun register(userId: String, name: String, phone: String = "") {
         val cleanName = name.trim()
         val cleanId = userId.trim()
+        val cleanPhone = phone.trim()
         if (cleanName.isEmpty()) {
             localFlags.update { it.copy(registerError = "Please enter your name.") }
             return
         }
         if (cleanId.isEmpty() || cleanId.contains(" ")) {
             localFlags.update {
-                it.copy(registerError = "Please enter a valid User ID without spaces.")
+                it.copy(registerError = "Please enter a valid User ID / Username without spaces.")
             }
             return
         }
 
         viewModelScope.launch {
             localFlags.update { it.copy(isRegistering = true, registerError = null) }
-            when (val result = repository.register(cleanId, cleanName)) {
+            when (val result = repository.register(cleanId, cleanName, cleanPhone)) {
                 is NetworkResult.Success -> {
                     localFlags.update { it.copy(isRegistering = false, registerError = null) }
                 }
@@ -189,7 +372,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             localFlags.update { it.copy(isSending = true, sendError = null) }
-            when (val result = repository.sendMessage(receiver, cleanText)) {
+            when (val result = repository.sendTextMessage(receiver, cleanText)) {
                 is NetworkResult.Success -> {
                     localFlags.update { it.copy(isSending = false, sendError = null) }
                     onSuccess()
@@ -212,12 +395,188 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun sendCurrentLocation(receiver: String, liveStream: Boolean = false) {
+        viewModelScope.launch {
+            localFlags.update { it.copy(isFetchingLocation = true) }
+            if (liveStream) {
+                val initial = repository.locationTracker.getCurrentLocation(isLive = true, durationMs = 15 * 60_000L)
+                localFlags.update { it.copy(isFetchingLocation = false) }
+                if (initial == null) {
+                    _toastEvents.tryEmit("Unable to acquire GPS fix. Enable location services.")
+                    return@launch
+                }
+                repository.startLiveLocationSharing(receiver, durationMinutes = 15)
+                _toastEvents.tryEmit("Live GPS sharing started for 15 minutes.")
+            } else {
+                val loc = repository.locationTracker.getCurrentLocation(isLive = false)
+                localFlags.update { it.copy(isFetchingLocation = false) }
+                if (loc == null) {
+                    _toastEvents.tryEmit("Unable to acquire GPS fix. Enable location services.")
+                    return@launch
+                }
+                val res = repository.sendLocationMessage(receiver, loc)
+                if (res is NetworkResult.Error) _toastEvents.tryEmit(res.message)
+            }
+        }
+    }
+
+    fun stopLiveLocationSharing() {
+        repository.stopLiveLocationSharing()
+        _toastEvents.tryEmit("Live location sharing stopped.")
+    }
+
+    fun sendMedia(receiver: String, uri: Uri, kind: MessageKind?) {
+        viewModelScope.launch {
+            localFlags.update { it.copy(isSending = true) }
+            when (val res = repository.sendMediaMessage(receiver, uri, kind)) {
+                is NetworkResult.Success -> localFlags.update { it.copy(isSending = false) }
+                is NetworkResult.Blocked -> {
+                    localFlags.update { it.copy(isSending = false, blockedAlertMessage = res.message) }
+                    _toastEvents.tryEmit(res.message)
+                }
+                is NetworkResult.Error -> {
+                    localFlags.update { it.copy(isSending = false) }
+                    _toastEvents.tryEmit(res.message)
+                }
+            }
+        }
+    }
+
+    fun deleteMessage(message: ChatMessage) {
+        viewModelScope.launch {
+            when (val res = repository.deleteChatMessage(message)) {
+                is NetworkResult.Success -> _toastEvents.tryEmit("Message deleted.")
+                is NetworkResult.Blocked -> _toastEvents.tryEmit(res.message)
+                is NetworkResult.Error -> _toastEvents.tryEmit(res.message)
+            }
+        }
+    }
+
+    // ==================== Social Actions ====================
+
+    fun createSocialPost(
+        mediaType: SocialMediaType,
+        mediaUri: Uri?,
+        caption: String,
+        shayariTag: String = ""
+    ) {
+        if (caption.isBlank() && mediaUri == null) {
+            _toastEvents.tryEmit("Add a photo, video, or caption to publish.")
+            return
+        }
+        viewModelScope.launch {
+            repository.createSocialPost(mediaType, mediaUri, caption, shayariTag)
+            _toastEvents.tryEmit(
+                if (mediaType == SocialMediaType.REEL) "Reel published!" else "Post shared to feed!"
+            )
+        }
+    }
+
+    fun toggleLikePost(postId: String) {
+        viewModelScope.launch { repository.toggleLikePost(postId) }
+    }
+
+    fun toggleBookmarkPost(postId: String) {
+        viewModelScope.launch { repository.toggleBookmarkPost(postId) }
+    }
+
+    fun addComment(postId: String, text: String) {
+        viewModelScope.launch { repository.addComment(postId, text) }
+    }
+
+    fun repostPost(postId: String) {
+        viewModelScope.launch {
+            repository.repostPost(postId)
+            _toastEvents.tryEmit("Reposted to your feed!")
+        }
+    }
+
+    fun sharePostToChat(post: SocialPost, targetUserId: String) {
+        val label = buildString {
+            append("Shared ${post.authorName}'s ${post.mediaType.name.lowercase()}: ")
+            if (post.caption.isNotBlank()) append(post.caption)
+        }
+        sendMessage(targetUserId, label) {
+            _toastEvents.tryEmit("Shared to chat!")
+        }
+    }
+
+    fun toggleFollowUser(targetUserId: String) {
+        viewModelScope.launch { repository.toggleFollowUser(targetUserId) }
+    }
+
+    fun updateMyBio(bio: String) {
+        viewModelScope.launch {
+            repository.updateMyBio(bio)
+            _toastEvents.tryEmit("Profile updated.")
+        }
+    }
+
+    // ==================== WebRTC Calling ====================
+
+    fun startCall(targetUserId: String, targetUserName: String, isVideo: Boolean) {
+        if (targetUserId == BROADCAST_TARGET_ID) {
+            _toastEvents.tryEmit("Select an individual user to start a WebRTC call.")
+            return
+        }
+        localFlags.update { it.copy(isCallScreenMinimized = false) }
+        webRTCClient.startOutgoingCall(targetUserId, targetUserName, isVideo)
+    }
+
+    fun acceptCall(withVideo: Boolean) {
+        localFlags.update { it.copy(isCallScreenMinimized = false) }
+        webRTCClient.acceptIncomingCall(withVideo)
+    }
+
+    fun declineOrEndCall() {
+        localFlags.update { it.copy(isCallScreenMinimized = false) }
+        webRTCClient.declineOrEndCall()
+    }
+
     fun selectTarget(targetId: String?) {
-        localFlags.update { it.copy(selectedTargetId = targetId, sendError = null) }
+        localFlags.update {
+            it.copy(
+                activeTab = if (targetId != null) AppTab.CHATS else it.activeTab,
+                selectedTargetId = targetId,
+                sendError = null,
+                showProfileSettings = false,
+                showActivityFeed = false
+            )
+        }
+        repository.setActiveChatTarget(targetId)
+        if (!targetId.isNullOrBlank()) {
+            viewModelScope.launch {
+                repository.markThreadAsRead(targetId)
+            }
+        }
+    }
+
+    fun openProfileSettings() {
+        localFlags.update { it.copy(showProfileSettings = true) }
+    }
+
+    fun closeProfileSettings() {
+        localFlags.update { it.copy(showProfileSettings = false) }
     }
 
     fun updateSearchQuery(query: String) {
         localFlags.update { it.copy(searchQuery = query) }
+        triggerRemoteUserSearch(query)
+    }
+
+    fun updateExploreQuery(query: String) {
+        localFlags.update { it.copy(exploreQuery = query) }
+        triggerRemoteUserSearch(query)
+    }
+
+    private fun triggerRemoteUserSearch(query: String) {
+        val clean = query.trim().removePrefix("@")
+        if (clean.length < 2) return
+        remoteSearchJob?.cancel()
+        remoteSearchJob = viewModelScope.launch {
+            delay(350L)
+            repository.searchRemoteUsers(clean)
+        }
     }
 
     fun clearRegisterError() {
@@ -228,10 +587,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         localFlags.update { it.copy(blockedAlertMessage = null) }
     }
 
-    fun signOut() {
+    fun logoutAndResetDeviceLock() {
         viewModelScope.launch {
             localFlags.value = LocalUiFlags()
-            repository.signOut()
+            repository.logoutAndResetDeviceLock()
+            _toastEvents.tryEmit("Device session lock reset.")
         }
     }
 }

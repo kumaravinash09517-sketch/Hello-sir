@@ -1,27 +1,60 @@
 package com.example.data
 
 import android.content.Context
+import android.net.Uri
+import com.example.data.local.ActivityNotificationEntity
+import com.example.data.local.ChatDatabase
+import com.example.data.local.MessageEntity
+import com.example.data.local.ProfileExtraEntity
+import com.example.data.local.SocialCommentEntity
+import com.example.data.local.SocialPostEntity
+import com.example.data.local.ThreadReadEntity
+import com.example.data.local.UserEntity
+import com.example.data.model.ActivityNotification
+import com.example.data.model.ActivityType
 import com.example.data.model.BLOCKED_MESSAGE
+import com.example.data.model.BROADCAST_TARGET_ID
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatUser
 import com.example.data.model.FeedPayload
+import com.example.data.model.LocationPayload
+import com.example.data.model.MediaPayload
+import com.example.data.model.MessageDeliveryStatus
+import com.example.data.model.MessageKind
 import com.example.data.model.NetworkResult
+import com.example.data.model.SignalingEnvelope
+import com.example.data.model.SocialActionEnvelope
+import com.example.data.model.SocialComment
+import com.example.data.model.SocialMediaType
+import com.example.data.model.SocialPost
+import com.example.data.model.UserProfileExtras
 import com.example.data.model.UserSession
+import com.example.data.network.ApiService
 import com.example.data.network.BackendJsonParser
-import com.example.data.network.HelloSirApi
+import com.example.data.network.MediaUploadService
 import com.example.data.network.RetrofitClient
+import com.example.data.network.SupabaseRestClient
+import com.example.location.LocationTracker
+import com.example.media.MediaHelper
 import com.example.notifications.ChatNotificationHelper
+import com.example.webrtc.CallUiState
+import com.example.webrtc.SignalingClient
+import com.example.webrtc.SignalingTransportState
+import com.example.webrtc.WebRTCClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
@@ -29,26 +62,73 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.net.SocketTimeoutException
+import java.util.Collections
+import java.util.Locale
+import java.util.UUID
 
 class ChatRepository(
     context: Context,
-    private val api: HelloSirApi = RetrofitClient.api,
-    private val sessionStore: SessionStore = SessionStore(context.applicationContext),
-    private val notificationHelper: ChatNotificationHelper = ChatNotificationHelper(context.applicationContext)
+    private val api: ApiService = RetrofitClient.apiService,
+    private val sessionManager: SessionManager = SessionManager(context.applicationContext),
+    private val database: ChatDatabase = ChatDatabase.getInstance(context.applicationContext),
+    private val notificationHelper: ChatNotificationHelper = ChatNotificationHelper(context.applicationContext),
+    private val mediaUploadService: MediaUploadService = MediaUploadService(context.applicationContext, api),
+    private val supabaseClient: SupabaseRestClient = SupabaseRestClient()
 ) {
+    private val appContext = context.applicationContext
+    private val dao = database.chatDao()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    val signalingClient = SignalingClient(RetrofitClient.okHttpClient, api)
+    val webRTCClient = WebRTCClient(appContext, signalingClient)
+    val locationTracker = LocationTracker(appContext)
+
     private var pollingJob: Job? = null
+    private var liveLocationJob: Job? = null
     private var baselineLoaded = false
-    private val seenMessageKeys = mutableSetOf<String>()
+    @Volatile
+    private var activePeerTarget: String? = null
+    private val seenMessageKeys = Collections.synchronizedSet(mutableSetOf<String>())
+    private val processedSocialActionIds = Collections.synchronizedSet(mutableSetOf<String>())
 
     private val _session = MutableStateFlow<UserSession?>(null)
     val session: StateFlow<UserSession?> = _session.asStateFlow()
 
-    private val _users = MutableStateFlow<List<ChatUser>>(emptyList())
-    val users: StateFlow<List<ChatUser>> = _users.asStateFlow()
+    val users: Flow<List<ChatUser>> = dao.observeUsers().map { entities ->
+        entities.map { it.toDomain() }
+    }
 
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
-    val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+    val messages: Flow<List<ChatMessage>> = dao.observeAllMessages().map { entities ->
+        entities.map { it.toDomain() }
+    }
+
+    val threadReads: Flow<Map<String, Long>> = dao.observeThreadReads().map { list ->
+        list.associate { it.threadId to it.lastReadMs }
+    }
+
+    val socialPosts: Flow<List<SocialPost>> = dao.observeSocialPosts().map { entities ->
+        entities.map { it.toDomain() }
+    }
+
+    val socialComments: Flow<Map<String, List<SocialComment>>> = dao.observeAllComments().map { list ->
+        list.map { it.toDomain() }.groupBy { it.postId }
+    }
+
+    val profileExtras: Flow<Map<String, UserProfileExtras>> = dao.observeProfileExtras().map { list ->
+        list.map { it.toDomain() }.associateBy { it.userId }
+    }
+
+    val activityNotifications: Flow<List<ActivityNotification>> =
+        dao.observeActivityNotifications().map { list ->
+            list.map { it.toDomain() }
+        }
+
+    val callState: StateFlow<CallUiState> = webRTCClient.callState
+    val signalingTransportState: StateFlow<SignalingTransportState> = signalingClient.transportState
+
+    private val _isLiveLocationSharing = MutableStateFlow(false)
+    val isLiveLocationSharing: StateFlow<Boolean> = _isLiveLocationSharing.asStateFlow()
 
     private val _lastSyncMs = MutableStateFlow<Long?>(null)
     val lastSyncMs: StateFlow<Long?> = _lastSyncMs.asStateFlow()
@@ -59,49 +139,142 @@ class ChatRepository(
     private val _blockedEvents = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val blockedEvents: SharedFlow<String> = _blockedEvents.asSharedFlow()
 
-    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
-
     init {
+        RetrofitClient.activeUserIdProvider = { _session.value?.userId }
+
         scope.launch {
-            seenMessageKeys.addAll(sessionStore.getNotifiedMessageIds())
-            sessionStore.sessionFlow.collect { saved ->
+            seenMessageKeys.addAll(sessionManager.getNotifiedMessageIds())
+
+            launch {
+                signalingClient.incomingSignals.collect { envelope ->
+                    handleIncomingSignal(envelope)
+                }
+            }
+            launch {
+                signalingClient.blockedSignals.collect { msg ->
+                    _blockedEvents.tryEmit(msg)
+                }
+            }
+
+            sessionManager.sessionFlow.collect { saved ->
                 _session.value = saved
                 if (saved != null) {
+                    webRTCClient.setCurrentUser(saved.userId, saved.name)
+                    signalingClient.connect(saved.userId)
+                    ensureMyProfileExtra(saved.userId)
                     startPolling()
                 } else {
+                    signalingClient.disconnect()
+                    webRTCClient.cleanupCallResources()
+                    stopLiveLocationSharing()
                     stopPolling()
                 }
             }
         }
     }
 
-    suspend fun register(userId: String, name: String): NetworkResult<UserSession> {
+    fun setActiveChatTarget(targetId: String?) {
+        activePeerTarget = targetId
+        if (!targetId.isNullOrBlank()) {
+            scope.launch { refreshFeed() }
+        }
+    }
+
+    private suspend fun ensureMyProfileExtra(userId: String) {
+        if (dao.getProfileExtra(userId) == null) {
+            dao.upsertProfileExtra(
+                ProfileExtraEntity(
+                    userId = userId,
+                    bio = "Connecting live on Hello Sir",
+                    followersCount = 0,
+                    followingCount = 0,
+                    isFollowedByMe = false
+                )
+            )
+        }
+    }
+
+    suspend fun register(userId: String, name: String, phone: String = ""): NetworkResult<UserSession> {
+        if (sessionManager.isDeviceLocked()) {
+            _session.value?.let { return NetworkResult.Success(it) }
+        }
         val cleanId = userId.trim()
         val cleanName = name.trim()
-        val json = JSONObject().apply {
+        val cleanPhone = phone.trim()
+        val deviceLockId = sessionManager.getOrCreateDeviceLockId()
+
+        val authPayload = JSONObject().apply {
             put("user_id", cleanId)
+            put("userId", cleanId)
+            put("username", cleanId)
             put("name", cleanName)
+            if (cleanPhone.isNotBlank()) put("phone", cleanPhone)
+            put("device_id", deviceLockId)
+            put("deviceId", deviceLockId)
         }.toString()
 
         return try {
-            val response = api.register(json.toRequestBody(jsonMediaType))
-            if (response.code() == 403) {
+            // 1. Direct login via /api/auth/login
+            var authResponse = api.login(authPayload.toRequestBody(jsonMediaType))
+            if (authResponse.code() == 403) {
                 _blockedEvents.tryEmit(BLOCKED_MESSAGE)
                 return NetworkResult.Blocked(BLOCKED_MESSAGE)
             }
-            if (!response.isSuccessful) {
-                val errBody = runCatching { response.errorBody()?.string() }.getOrNull()
-                return NetworkResult.Error(extractErrorMessage(errBody, "Registration failed (${response.code()})"))
+
+            // 2. If user does not exist yet or login returned 404/401/400, register via /api/users/register
+            if (!authResponse.isSuccessful) {
+                authResponse = api.register(authPayload.toRequestBody(jsonMediaType))
+                if (authResponse.code() == 403) {
+                    _blockedEvents.tryEmit(BLOCKED_MESSAGE)
+                    return NetworkResult.Blocked(BLOCKED_MESSAGE)
+                }
             }
-            val newSession = UserSession(userId = cleanId, name = cleanName)
-            sessionStore.saveSession(cleanId, cleanName)
-            _session.value = newSession
+
+            if (!authResponse.isSuccessful) {
+                val errBody = runCatching { authResponse.errorBody()?.string() }.getOrNull()
+                return NetworkResult.Error(extractErrorMessage(errBody, "Registration failed (${authResponse.code()})"))
+            }
+
+            val respBody = runCatching { authResponse.body()?.string().orEmpty() }.getOrDefault("")
+            val parsedUser = BackendJsonParser.parseUsers(respBody).firstOrNull()
+            val resolvedId = parsedUser?.userId?.takeIf { it.isNotBlank() } ?: cleanId
+            val resolvedName = parsedUser?.name?.takeIf { it.isNotBlank() } ?: cleanName
+            val resolvedPhone = parsedUser?.phone?.takeIf { it.isNotBlank() } ?: cleanPhone
+
+            // 3. Ensure profile is saved via /api/users/profile
+            runCatching {
+                val profileJson = JSONObject().apply {
+                    put("user_id", resolvedId)
+                    put("userId", resolvedId)
+                    put("username", resolvedId)
+                    put("name", resolvedName)
+                    if (resolvedPhone.isNotBlank()) put("phone", resolvedPhone)
+                    put("device_id", deviceLockId)
+                }.toString()
+                api.createOrUpdateProfile(profileJson.toRequestBody(jsonMediaType))
+            }
+
+            // 4. Mirror to Supabase REST cleanly if configured
+            scope.launch {
+                supabaseClient.upsertUserProfile(
+                    userId = resolvedId,
+                    name = resolvedName,
+                    phone = resolvedPhone,
+                    deviceId = deviceLockId
+                )
+            }
+
+            val lockedSession = sessionManager.lockSession(resolvedId, resolvedName, resolvedPhone)
+            _session.value = lockedSession
+            webRTCClient.setCurrentUser(lockedSession.userId, lockedSession.name)
+            signalingClient.connect(lockedSession.userId)
+            ensureMyProfileExtra(lockedSession.userId)
             baselineLoaded = false
             refreshFeed()
             startPolling()
-            NetworkResult.Success(newSession)
+            NetworkResult.Success(lockedSession)
         } catch (e: SocketTimeoutException) {
-            NetworkResult.Error("Server is waking up or timed out. Please tap Connect again.")
+            NetworkResult.Error("Server is waking up on Render (cold start). Please tap Connect again.")
         } catch (e: IOException) {
             NetworkResult.Error("Network connection error. Check your internet and try again.")
         } catch (e: Exception) {
@@ -109,37 +282,156 @@ class ChatRepository(
         }
     }
 
+    suspend fun searchRemoteUsers(query: String): List<ChatUser> {
+        val clean = query.trim().removePrefix("@")
+        if (clean.isEmpty()) return emptyList()
+
+        val found = mutableListOf<ChatUser>()
+        runCatching {
+            val searchResp = api.searchUsers(clean)
+            if (searchResp.code() == 403) {
+                _blockedEvents.tryEmit(BLOCKED_MESSAGE)
+                return emptyList()
+            }
+            if (searchResp.isSuccessful) {
+                found += BackendJsonParser.parseUsers(searchResp.body()?.string().orEmpty())
+            }
+        }
+        runCatching {
+            val findResp = api.findUser(
+                userId = clean,
+                userIdSnake = clean,
+                username = clean,
+                phone = if (clean.all { it.isDigit() || it == '+' }) clean else null
+            )
+            if (findResp.isSuccessful) {
+                found += BackendJsonParser.parseUsers(findResp.body()?.string().orEmpty())
+            }
+        }
+
+        val deduped = found.distinctBy { it.userId }
+        if (deduped.isNotEmpty()) {
+            dao.upsertUsers(deduped.map { UserEntity.fromDomain(it) })
+        }
+        return deduped
+    }
+
     suspend fun refreshFeed(): NetworkResult<FeedPayload> {
+        val currentUser = _session.value ?: return NetworkResult.Error("Not logged in.")
         return try {
-            val response = api.getFeed()
-            if (response.code() == 403) {
+            // 1. Fetch active users list from /api/users
+            val usersResp = api.getUsers()
+            if (usersResp.code() == 403) {
                 _blockedEvents.tryEmit(BLOCKED_MESSAGE)
                 return NetworkResult.Blocked(BLOCKED_MESSAGE)
             }
-            if (!response.isSuccessful) {
-                val err = "Sync error (${response.code()})"
+            if (!usersResp.isSuccessful) {
+                val err = "Sync error (${usersResp.code()})"
                 _syncError.value = err
                 return NetworkResult.Error(err)
             }
 
-            val rawBody = response.body()?.string().orEmpty()
-            val payload = BackendJsonParser.parseFeed(rawBody)
+            val rawUsers = usersResp.body()?.string().orEmpty()
+            val parsedUsersFromUsersApi = BackendJsonParser.parseUsers(rawUsers)
+            val parsedUsersFeed = BackendJsonParser.parseFeed(rawUsers)
 
-            val now = System.currentTimeMillis()
-            val sortedUsers = payload.users.sortedWith(
-                compareByDescending<ChatUser> { it.isOnline(now) }
-                    .thenBy { it.name.lowercase() }
-            )
+            val allUsers = mutableListOf<ChatUser>()
+            allUsers += parsedUsersFromUsersApi
+            if (parsedUsersFeed.users.isNotEmpty()) {
+                allUsers += parsedUsersFeed.users
+            }
 
-            _users.value = sortedUsers
-            _messages.value = payload.messages
-            _lastSyncMs.value = now
+            // Optional Supabase user enrichment if configured
+            if (supabaseClient.isConfigured()) {
+                allUsers += supabaseClient.fetchUsers()
+            }
+
+            val dedupedUsers = allUsers
+                .filter { it.userId.isNotBlank() }
+                .associateBy { it.userId }
+                .values
+                .toList()
+
+            if (dedupedUsers.isNotEmpty()) {
+                dao.upsertUsers(dedupedUsers.map { UserEntity.fromDomain(it) })
+                dedupedUsers.forEach { u ->
+                    if (!u.bio.isNullOrBlank()) {
+                        val existing = dao.getProfileExtra(u.userId)?.toDomain()
+                            ?: UserProfileExtras(userId = u.userId)
+                        dao.upsertProfileExtra(ProfileExtraEntity.fromDomain(existing.copy(bio = u.bio)))
+                    }
+                }
+            }
+
+            // 2. Determine peer message endpoints to fetch via /api/messages/<peer_id>?userId=<me>
+            val peerIdsToPoll = linkedSetOf(BROADCAST_TARGET_ID)
+            activePeerTarget?.takeIf { it.isNotBlank() }?.let { peerIdsToPoll.add(it) }
+            val existingUsers = dedupedUsers.ifEmpty { dao.observeUsers().first().map { it.toDomain() } }
+            existingUsers
+                .filterNot { it.userId.equals(currentUser.userId, ignoreCase = true) }
+                .sortedByDescending { it.lastSeenEpochMs ?: 0L }
+                .take(6)
+                .forEach { peerIdsToPoll.add(it.userId) }
+
+            val collectedMessages = mutableListOf<ChatMessage>()
+            val collectedSignals = mutableListOf<SignalingEnvelope>()
+            val collectedPosts = mutableListOf<SocialPost>()
+            val collectedActions = mutableListOf<SocialActionEnvelope>()
+
+            collectedMessages += parsedUsersFeed.messages
+            collectedSignals += parsedUsersFeed.signals
+            collectedPosts += parsedUsersFeed.posts
+            collectedActions += parsedUsersFeed.socialActions
+
+            for (peerId in peerIdsToPoll) {
+                val msgResp = runCatching {
+                    api.getMessagesWithPeer(peerId = peerId, userId = currentUser.userId)
+                }.getOrNull() ?: continue
+
+                if (msgResp.code() == 403) {
+                    _blockedEvents.tryEmit(BLOCKED_MESSAGE)
+                    return NetworkResult.Blocked(BLOCKED_MESSAGE)
+                }
+                if (msgResp.isSuccessful) {
+                    val bodyStr = msgResp.body()?.string().orEmpty()
+                    val feed = BackendJsonParser.parseFeed(bodyStr)
+                    collectedMessages += feed.messages
+                    collectedSignals += feed.signals
+                    collectedPosts += feed.posts
+                    collectedActions += feed.socialActions
+                }
+            }
+
+            if (collectedSignals.isNotEmpty()) {
+                signalingClient.onRestSignalsReceived(collectedSignals)
+            }
+            val finalMessages = collectedMessages.distinctBy { it.dedupeKey }.sortedBy { it.timestampMs }
+            if (finalMessages.isNotEmpty()) {
+                dao.upsertMessages(finalMessages.map { MessageEntity.fromDomain(it) })
+            }
+            val finalPosts = collectedPosts.distinctBy { it.id }
+            if (finalPosts.isNotEmpty()) {
+                dao.insertSocialPostsIfAbsent(finalPosts.map { SocialPostEntity.fromDomain(it) })
+            }
+            if (collectedActions.isNotEmpty()) {
+                applyIncomingSocialActions(collectedActions.distinctBy { it.actionId })
+            }
+
+            _lastSyncMs.value = System.currentTimeMillis()
             _syncError.value = null
 
-            processIncomingNotifications(sortedUsers, payload.messages)
-            NetworkResult.Success(payload)
+            processIncomingNotifications(dedupedUsers, finalMessages)
+            NetworkResult.Success(
+                FeedPayload(
+                    users = dedupedUsers,
+                    messages = finalMessages,
+                    signals = collectedSignals,
+                    posts = finalPosts,
+                    socialActions = collectedActions
+                )
+            )
         } catch (e: SocketTimeoutException) {
-            val msg = "Connection timed out while syncing."
+            val msg = "Server is waking up / timed out while syncing."
             _syncError.value = msg
             NetworkResult.Error(msg)
         } catch (e: IOException) {
@@ -153,62 +445,693 @@ class ChatRepository(
         }
     }
 
-    suspend fun sendMessage(receiver: String, text: String): NetworkResult<Unit> {
-        val currentUser = _session.value
-            ?: return NetworkResult.Error("Not logged in.")
+    // ==================== Chat Messaging ====================
+
+    suspend fun sendTextMessage(receiver: String, text: String): NetworkResult<Unit> {
         val cleanText = text.trim()
-        if (cleanText.isEmpty()) {
-            return NetworkResult.Error("Message cannot be empty.")
+        if (cleanText.isEmpty()) return NetworkResult.Error("Message cannot be empty.")
+        return sendOutgoingMessage(
+            receiver = receiver,
+            wireText = cleanText,
+            displayText = cleanText,
+            kind = MessageKind.TEXT
+        )
+    }
+
+    suspend fun sendLocationMessage(receiver: String, location: LocationPayload): NetworkResult<Unit> {
+        val wireText = BackendJsonParser.encodeLocation(location)
+        val displayText = if (location.isLive) "Live GPS Location" else "Shared Location"
+        return sendOutgoingMessage(
+            receiver = receiver,
+            wireText = wireText,
+            displayText = displayText,
+            kind = MessageKind.LOCATION,
+            location = location
+        )
+    }
+
+    suspend fun sendMediaMessage(receiver: String, uri: Uri, forcedKind: MessageKind?): NetworkResult<Unit> {
+        val currentUser = _session.value ?: return NetworkResult.Error("Not logged in.")
+        val inspected = MediaHelper.inspectPickedUri(appContext, uri, forcedKind)
+        val uploaded = mediaUploadService.uploadUri(
+            uri = uri,
+            fileName = inspected.displayName,
+            mimeType = inspected.mimeType,
+            userId = currentUser.userId,
+            mediaTypeTag = inspected.kind.name.lowercase(Locale.US)
+        )
+        val finalPayload = if (uploaded != null) {
+            inspected.copy(localUri = uploaded.remoteUrl)
+        } else {
+            inspected
+        }
+        val wireText = BackendJsonParser.encodeMedia(finalPayload)
+        return sendOutgoingMessage(
+            receiver = receiver,
+            wireText = wireText,
+            displayText = finalPayload.displayName,
+            kind = finalPayload.kind,
+            media = finalPayload
+        )
+    }
+
+    suspend fun deleteChatMessage(message: ChatMessage): NetworkResult<Unit> {
+        val currentUser = _session.value ?: return NetworkResult.Error("Not logged in.")
+        dao.deleteMessage(message.dedupeKey, message.id)
+        if (message.id.startsWith("local_")) {
+            return NetworkResult.Success(Unit)
+        }
+        return try {
+            val response = api.deleteMessage(message.id, currentUser.userId)
+            if (response.code() == 403) {
+                _blockedEvents.tryEmit(BLOCKED_MESSAGE)
+                return NetworkResult.Blocked(BLOCKED_MESSAGE)
+            }
+            NetworkResult.Success(Unit)
+        } catch (e: IOException) {
+            NetworkResult.Error("Deleted locally; server unreachable.")
+        }
+    }
+
+    private suspend fun sendOutgoingMessage(
+        receiver: String,
+        wireText: String,
+        displayText: String,
+        kind: MessageKind,
+        location: LocationPayload? = null,
+        media: MediaPayload? = null
+    ): NetworkResult<Unit> {
+        val currentUser = _session.value ?: return NetworkResult.Error("Not logged in.")
+        val target = receiver.trim()
+        val now = System.currentTimeMillis()
+        val localId = "local_${now}_${UUID.randomUUID().toString().take(6)}"
+
+        val optimisticMsg = ChatMessage(
+            id = localId,
+            sender = currentUser.userId,
+            senderName = currentUser.name,
+            receiver = target,
+            text = displayText,
+            timestampMs = now,
+            kind = kind,
+            deliveryStatus = MessageDeliveryStatus.PENDING,
+            location = location,
+            media = media
+        )
+        seenMessageKeys.add(optimisticMsg.dedupeKey)
+        dao.insertMessage(MessageEntity.fromDomain(optimisticMsg))
+        markThreadAsRead(target)
+
+        val mediaUrl = media?.localUri?.takeIf {
+            it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
+        }
+        val msgTypeStr = when (kind) {
+            MessageKind.TEXT -> "text"
+            MessageKind.IMAGE -> "image"
+            MessageKind.VIDEO -> "video"
+            MessageKind.AUDIO -> "audio"
+            MessageKind.DOCUMENT -> "document"
+            MessageKind.LOCATION -> "location"
         }
 
         val json = JSONObject().apply {
+            put("sender_id", currentUser.userId)
+            put("senderId", currentUser.userId)
             put("sender", currentUser.userId)
-            put("receiver", receiver.trim())
-            put("text", cleanText)
+            put("receiver_id", target)
+            put("receiverId", target)
+            put("receiver", target)
+            put("message", wireText)
+            put("text", wireText)
+            put("content", wireText)
+            if (mediaUrl != null) {
+                put("media_url", mediaUrl)
+                put("mediaUrl", mediaUrl)
+            }
+            put("msg_type", msgTypeStr)
+            put("type", msgTypeStr)
+            if (location != null) {
+                put("latitude", location.latitude)
+                put("longitude", location.longitude)
+                put("location_label", location.label)
+                put("locationLabel", location.label)
+            }
+            put("timestamp", now)
+            put("is_read", false)
+            put("isRead", false)
         }.toString()
 
         return try {
             val response = api.sendMessage(json.toRequestBody(jsonMediaType))
             if (response.code() == 403) {
+                dao.deleteMessage(optimisticMsg.dedupeKey)
                 _blockedEvents.tryEmit(BLOCKED_MESSAGE)
                 return NetworkResult.Blocked(BLOCKED_MESSAGE)
             }
             if (!response.isSuccessful) {
                 val errBody = runCatching { response.errorBody()?.string() }.getOrNull()
-                return NetworkResult.Error(extractErrorMessage(errBody, "Failed to send message (${response.code()})"))
+                return NetworkResult.Error(extractErrorMessage(errBody, "Failed to send (${response.code()})"))
             }
 
-            // Append optimistic local message immediately, then reconcile via GET /get
-            val optimisticMsg = ChatMessage(
-                id = "local_${System.currentTimeMillis()}_${cleanText.hashCode()}",
-                sender = currentUser.userId,
-                senderName = currentUser.name,
-                receiver = receiver.trim(),
-                text = cleanText,
-                timestampMs = System.currentTimeMillis()
+            dao.insertMessage(
+                MessageEntity.fromDomain(
+                    optimisticMsg.copy(deliveryStatus = MessageDeliveryStatus.SENT)
+                )
             )
-            seenMessageKeys.add(optimisticMsg.dedupeKey)
-            _messages.value = (_messages.value + optimisticMsg).distinctBy { it.dedupeKey }
-
             refreshFeed()
             NetworkResult.Success(Unit)
         } catch (e: SocketTimeoutException) {
-            NetworkResult.Error("Send timed out. Please try again.")
+            NetworkResult.Error("Server timed out (cold start). Message kept locally; retry shortly.")
         } catch (e: IOException) {
-            NetworkResult.Error("Network unavailable. Message not sent.")
+            NetworkResult.Error("Network unavailable. Message queued locally.")
         } catch (e: Exception) {
             NetworkResult.Error(e.localizedMessage ?: "Failed to send message.")
         }
     }
 
-    suspend fun signOut() {
+    suspend fun markThreadAsRead(threadId: String) {
+        val currentUser = _session.value ?: return
+        val now = System.currentTimeMillis()
+        dao.markThreadRead(ThreadReadEntity(threadId = threadId, lastReadMs = now))
+
+        if (threadId != BROADCAST_TARGET_ID && !threadId.equals(currentUser.userId, ignoreCase = true)) {
+            scope.launch {
+                runCatching {
+                    val body = JSONObject().apply {
+                        put("userId", currentUser.userId)
+                        put("user_id", currentUser.userId)
+                        put("is_read", true)
+                        put("isRead", true)
+                    }.toString()
+                    api.markMessagesRead(threadId, body.toRequestBody(jsonMediaType))
+                }
+                signalingClient.sendSignal(
+                    SignalingEnvelope(
+                        signalId = "read_${currentUser.userId}_${threadId}_${now / 3000}",
+                        type = "read_receipt",
+                        sender = currentUser.userId,
+                        senderName = currentUser.name,
+                        receiver = threadId,
+                        timestampMs = now
+                    )
+                )
+            }
+        }
+    }
+
+    // ==================== Social Media Actions ====================
+
+    suspend fun createSocialPost(
+        mediaType: SocialMediaType,
+        mediaUri: Uri?,
+        caption: String,
+        shayariTag: String = ""
+    ): NetworkResult<SocialPost> {
+        val me = _session.value ?: return NetworkResult.Error("Not logged in.")
+        val mediaPayload = mediaUri?.let {
+            val forced = when (mediaType) {
+                SocialMediaType.PHOTO -> MessageKind.IMAGE
+                SocialMediaType.REEL -> MessageKind.VIDEO
+                SocialMediaType.QUOTE -> null
+            }
+            val inspected = MediaHelper.inspectPickedUri(appContext, it, forced)
+            val uploaded = mediaUploadService.uploadUri(
+                uri = it,
+                fileName = inspected.displayName,
+                mimeType = inspected.mimeType,
+                userId = me.userId,
+                mediaTypeTag = mediaType.name.lowercase(Locale.US)
+            )
+            if (uploaded != null) inspected.copy(localUri = uploaded.remoteUrl) else inspected
+        }
+        val post = SocialPost(
+            id = "post_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}",
+            authorId = me.userId,
+            authorName = me.name,
+            mediaType = mediaType,
+            mediaUri = mediaPayload?.localUri.orEmpty(),
+            inlineImageBase64 = mediaPayload?.inlineDataBase64.orEmpty(),
+            caption = caption.trim(),
+            shayariTag = shayariTag.trim(),
+            timestampMs = System.currentTimeMillis(),
+            reachCount = 1
+        )
+        dao.upsertSocialPost(SocialPostEntity.fromDomain(post))
+
+        val wire = BackendJsonParser.encodePost(post)
+        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, wire, mediaPayload?.localUri)
+        return NetworkResult.Success(post)
+    }
+
+    suspend fun toggleLikePost(postId: String) {
+        val me = _session.value ?: return
+        val existing = dao.getPostById(postId)?.toDomain() ?: return
+        val nowLiked = !existing.isLikedByMe
+        val updated = existing.copy(
+            isLikedByMe = nowLiked,
+            likeCount = (existing.likeCount + if (nowLiked) 1 else -1).coerceAtLeast(0),
+            reachCount = existing.reachCount + if (nowLiked) 1 else 0
+        )
+        dao.upsertSocialPost(SocialPostEntity.fromDomain(updated))
+
+        if (nowLiked) {
+            dao.insertActivityNotification(
+                ActivityNotificationEntity.fromDomain(
+                    ActivityNotification(
+                        id = "act_like_${postId}_${me.userId}",
+                        type = ActivityType.LIKE,
+                        actorId = me.userId,
+                        actorName = me.name,
+                        postId = postId,
+                        postSnippet = existing.caption.take(48),
+                        timestampMs = System.currentTimeMillis(),
+                        isRead = existing.authorId.equals(me.userId, ignoreCase = true)
+                    )
+                )
+            )
+        }
+
+        val action = SocialActionEnvelope(
+            actionId = "act_${UUID.randomUUID()}",
+            actionType = if (nowLiked) "like" else "unlike",
+            actorId = me.userId,
+            actorName = me.name,
+            targetUserId = existing.authorId,
+            postId = postId
+        )
+        processedSocialActionIds.add(action.actionId)
+        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
+    }
+
+    suspend fun toggleBookmarkPost(postId: String) {
+        val existing = dao.getPostById(postId)?.toDomain() ?: return
+        val updated = existing.copy(isBookmarkedByMe = !existing.isBookmarkedByMe)
+        dao.upsertSocialPost(SocialPostEntity.fromDomain(updated))
+    }
+
+    suspend fun addComment(postId: String, text: String) {
+        val me = _session.value ?: return
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val comment = SocialComment(
+            id = "cmt_${now}_${UUID.randomUUID().toString().take(6)}",
+            postId = postId,
+            authorId = me.userId,
+            authorName = me.name,
+            text = clean,
+            timestampMs = now
+        )
+        dao.insertComment(SocialCommentEntity.fromDomain(comment))
+
+        val existing = dao.getPostById(postId)?.toDomain()
+        if (existing != null) {
+            dao.upsertSocialPost(
+                SocialPostEntity.fromDomain(
+                    existing.copy(
+                        commentCount = existing.commentCount + 1,
+                        reachCount = existing.reachCount + 2
+                    )
+                )
+            )
+            dao.insertActivityNotification(
+                ActivityNotificationEntity.fromDomain(
+                    ActivityNotification(
+                        id = "act_${comment.id}",
+                        type = ActivityType.COMMENT,
+                        actorId = me.userId,
+                        actorName = me.name,
+                        postId = postId,
+                        postSnippet = clean.take(60),
+                        timestampMs = now,
+                        isRead = existing.authorId.equals(me.userId, ignoreCase = true)
+                    )
+                )
+            )
+        }
+
+        val action = SocialActionEnvelope(
+            actionId = "act_${comment.id}",
+            actionType = "comment",
+            actorId = me.userId,
+            actorName = me.name,
+            targetUserId = existing?.authorId.orEmpty(),
+            postId = postId,
+            payloadText = clean,
+            timestampMs = now
+        )
+        processedSocialActionIds.add(action.actionId)
+        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
+    }
+
+    suspend fun repostPost(postId: String) {
+        val me = _session.value ?: return
+        val original = dao.getPostById(postId)?.toDomain() ?: return
+        val now = System.currentTimeMillis()
+        dao.upsertSocialPost(
+            SocialPostEntity.fromDomain(
+                original.copy(
+                    shareCount = original.shareCount + 1,
+                    reachCount = original.reachCount + 3
+                )
+            )
+        )
+        val repost = original.copy(
+            id = "repost_${now}_${UUID.randomUUID().toString().take(6)}",
+            authorId = me.userId,
+            authorName = me.name,
+            timestampMs = now,
+            likeCount = 0,
+            commentCount = 0,
+            shareCount = 0,
+            reachCount = 1,
+            isLikedByMe = false,
+            isBookmarkedByMe = false,
+            isRepost = true,
+            repostedFromName = original.authorName
+        )
+        dao.upsertSocialPost(SocialPostEntity.fromDomain(repost))
+        dao.insertActivityNotification(
+            ActivityNotificationEntity.fromDomain(
+                ActivityNotification(
+                    id = "act_${repost.id}",
+                    type = ActivityType.REPOST,
+                    actorId = me.userId,
+                    actorName = me.name,
+                    postId = original.id,
+                    postSnippet = original.caption.take(48),
+                    timestampMs = now,
+                    isRead = original.authorId.equals(me.userId, ignoreCase = true)
+                )
+            )
+        )
+        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodePost(repost))
+    }
+
+    suspend fun toggleFollowUser(targetUserId: String) {
+        val me = _session.value ?: return
+        if (targetUserId.equals(me.userId, ignoreCase = true)) return
+
+        val targetExtra = dao.getProfileExtra(targetUserId)?.toDomain()
+            ?: UserProfileExtras(userId = targetUserId)
+        val myExtra = dao.getProfileExtra(me.userId)?.toDomain()
+            ?: UserProfileExtras(userId = me.userId)
+
+        val nowFollowing = !targetExtra.isFollowedByMe
+        val delta = if (nowFollowing) 1 else -1
+
+        dao.upsertProfileExtra(
+            ProfileExtraEntity.fromDomain(
+                targetExtra.copy(
+                    isFollowedByMe = nowFollowing,
+                    followersCount = (targetExtra.followersCount + delta).coerceAtLeast(0)
+                )
+            )
+        )
+        dao.upsertProfileExtra(
+            ProfileExtraEntity.fromDomain(
+                myExtra.copy(
+                    followingCount = (myExtra.followingCount + delta).coerceAtLeast(0)
+                )
+            )
+        )
+
+        if (nowFollowing) {
+            dao.insertActivityNotification(
+                ActivityNotificationEntity.fromDomain(
+                    ActivityNotification(
+                        id = "act_follow_${me.userId}_${targetUserId}",
+                        type = ActivityType.FOLLOW,
+                        actorId = me.userId,
+                        actorName = me.name,
+                        postSnippet = "Started following @$targetUserId",
+                        timestampMs = System.currentTimeMillis(),
+                        isRead = false
+                    )
+                )
+            )
+        }
+
+        val action = SocialActionEnvelope(
+            actionId = "act_${UUID.randomUUID()}",
+            actionType = if (nowFollowing) "follow" else "unfollow",
+            actorId = me.userId,
+            actorName = me.name,
+            targetUserId = targetUserId
+        )
+        processedSocialActionIds.add(action.actionId)
+        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
+    }
+
+    suspend fun updateMyBio(newBio: String) {
+        val me = _session.value ?: return
+        val clean = newBio.trim()
+        val existing = dao.getProfileExtra(me.userId)?.toDomain()
+            ?: UserProfileExtras(userId = me.userId)
+        dao.upsertProfileExtra(
+            ProfileExtraEntity.fromDomain(existing.copy(bio = clean))
+        )
+
+        // Update profile on Render (/api/users/profile) and Supabase REST
+        val profileJson = JSONObject().apply {
+            put("user_id", me.userId)
+            put("userId", me.userId)
+            put("name", me.name)
+            put("bio", clean)
+            if (me.phone.isNotBlank()) put("phone", me.phone)
+        }.toString()
+
+        runCatching {
+            val putResp = api.updateProfile(profileJson.toRequestBody(jsonMediaType))
+            if (!putResp.isSuccessful) {
+                api.createOrUpdateProfile(profileJson.toRequestBody(jsonMediaType))
+            }
+        }
+        scope.launch {
+            supabaseClient.upsertUserProfile(
+                userId = me.userId,
+                name = me.name,
+                phone = me.phone,
+                deviceId = me.deviceLockId,
+                bio = clean
+            )
+        }
+
+        val action = SocialActionEnvelope(
+            actionId = "bio_${UUID.randomUUID()}",
+            actionType = "profile_bio",
+            actorId = me.userId,
+            actorName = me.name,
+            targetUserId = me.userId,
+            payloadText = clean
+        )
+        processedSocialActionIds.add(action.actionId)
+        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
+    }
+
+    suspend fun markAllActivityRead() {
+        dao.markAllActivityRead()
+    }
+
+    private suspend fun sendSocialWireEnvelope(
+        sender: String,
+        receiver: String,
+        wireText: String,
+        mediaUrl: String? = null
+    ) {
+        val json = JSONObject().apply {
+            put("sender_id", sender)
+            put("senderId", sender)
+            put("sender", sender)
+            put("receiver_id", receiver)
+            put("receiverId", receiver)
+            put("receiver", receiver)
+            put("message", wireText)
+            put("text", wireText)
+            put("content", wireText)
+            if (!mediaUrl.isNullOrBlank() && mediaUrl.startsWith("http", ignoreCase = true)) {
+                put("media_url", mediaUrl)
+                put("mediaUrl", mediaUrl)
+            }
+            put("msg_type", "social")
+            put("type", "social")
+            put("timestamp", System.currentTimeMillis())
+        }.toString()
+        runCatching {
+            val resp = api.sendMessage(json.toRequestBody(jsonMediaType))
+            if (resp.code() == 403) {
+                _blockedEvents.tryEmit(BLOCKED_MESSAGE)
+            }
+        }
+    }
+
+    private suspend fun applyIncomingSocialActions(actions: List<SocialActionEnvelope>) {
+        val me = _session.value ?: return
+        for (action in actions) {
+            if (!processedSocialActionIds.add(action.actionId)) continue
+            if (action.actorId.equals(me.userId, ignoreCase = true)) continue
+
+            when (action.actionType) {
+                "like", "unlike" -> {
+                    val post = dao.getPostById(action.postId)?.toDomain() ?: continue
+                    val delta = if (action.actionType == "like") 1 else -1
+                    dao.upsertSocialPost(
+                        SocialPostEntity.fromDomain(
+                            post.copy(
+                                likeCount = (post.likeCount + delta).coerceAtLeast(0),
+                                reachCount = post.reachCount + if (delta > 0) 1 else 0
+                            )
+                        )
+                    )
+                    if (action.actionType == "like" && post.authorId.equals(me.userId, ignoreCase = true)) {
+                        dao.insertActivityNotification(
+                            ActivityNotificationEntity.fromDomain(
+                                ActivityNotification(
+                                    id = action.actionId,
+                                    type = ActivityType.LIKE,
+                                    actorId = action.actorId,
+                                    actorName = action.actorName,
+                                    postId = post.id,
+                                    postSnippet = post.caption.take(48),
+                                    timestampMs = action.timestampMs
+                                )
+                            )
+                        )
+                    }
+                }
+
+                "comment" -> {
+                    dao.insertComment(
+                        SocialCommentEntity(
+                            id = action.actionId,
+                            postId = action.postId,
+                            authorId = action.actorId,
+                            authorName = action.actorName,
+                            text = action.payloadText,
+                            timestampMs = action.timestampMs
+                        )
+                    )
+                    val post = dao.getPostById(action.postId)?.toDomain()
+                    if (post != null) {
+                        dao.upsertSocialPost(
+                            SocialPostEntity.fromDomain(
+                                post.copy(
+                                    commentCount = post.commentCount + 1,
+                                    reachCount = post.reachCount + 2
+                                )
+                            )
+                        )
+                        if (post.authorId.equals(me.userId, ignoreCase = true)) {
+                            dao.insertActivityNotification(
+                                ActivityNotificationEntity.fromDomain(
+                                    ActivityNotification(
+                                        id = action.actionId,
+                                        type = ActivityType.COMMENT,
+                                        actorId = action.actorId,
+                                        actorName = action.actorName,
+                                        postId = post.id,
+                                        postSnippet = action.payloadText.take(60),
+                                        timestampMs = action.timestampMs
+                                    )
+                                )
+                            )
+                        }
+                    }
+                }
+
+                "follow", "unfollow" -> {
+                    val delta = if (action.actionType == "follow") 1 else -1
+                    val targetExtra = dao.getProfileExtra(action.targetUserId)?.toDomain()
+                        ?: UserProfileExtras(userId = action.targetUserId)
+                    dao.upsertProfileExtra(
+                        ProfileExtraEntity.fromDomain(
+                            targetExtra.copy(
+                                followersCount = (targetExtra.followersCount + delta).coerceAtLeast(0)
+                            )
+                        )
+                    )
+                    if (action.actionType == "follow" &&
+                        action.targetUserId.equals(me.userId, ignoreCase = true)
+                    ) {
+                        dao.insertActivityNotification(
+                            ActivityNotificationEntity.fromDomain(
+                                ActivityNotification(
+                                    id = action.actionId,
+                                    type = ActivityType.FOLLOW,
+                                    actorId = action.actorId,
+                                    actorName = action.actorName,
+                                    postSnippet = "Started following you",
+                                    timestampMs = action.timestampMs
+                                )
+                            )
+                        )
+                    }
+                }
+
+                "profile_bio" -> {
+                    val extra = dao.getProfileExtra(action.actorId)?.toDomain()
+                        ?: UserProfileExtras(userId = action.actorId)
+                    dao.upsertProfileExtra(
+                        ProfileExtraEntity.fromDomain(extra.copy(bio = action.payloadText))
+                    )
+                }
+            }
+        }
+    }
+
+    // ==================== Live GPS & Lifecycle ====================
+
+    fun startLiveLocationSharing(receiver: String, durationMinutes: Int = 15) {
+        liveLocationJob?.cancel()
+        _isLiveLocationSharing.value = true
+        val durationMs = durationMinutes * 60_000L
+        liveLocationJob = scope.launch {
+            try {
+                locationTracker.liveLocationStream(durationMs).collect { locPayload ->
+                    sendLocationMessage(receiver, locPayload)
+                }
+            } finally {
+                _isLiveLocationSharing.value = false
+            }
+        }
+    }
+
+    fun stopLiveLocationSharing() {
+        liveLocationJob?.cancel()
+        liveLocationJob = null
+        _isLiveLocationSharing.value = false
+    }
+
+    suspend fun logoutAndResetDeviceLock() {
         stopPolling()
+        stopLiveLocationSharing()
+        signalingClient.disconnect()
+        webRTCClient.cleanupCallResources()
         baselineLoaded = false
-        _users.value = emptyList()
-        _messages.value = emptyList()
+        activePeerTarget = null
         _syncError.value = null
-        sessionStore.clearSession()
+        dao.clearUsers()
+        dao.clearMessages()
+        dao.clearThreadReads()
+        dao.clearSocialPosts()
+        dao.clearSocialComments()
+        dao.clearProfileExtras()
+        dao.clearActivityNotifications()
+        sessionManager.resetSessionLock()
         _session.value = null
+    }
+
+    private suspend fun handleIncomingSignal(envelope: SignalingEnvelope) {
+        val currentUser = _session.value ?: return
+        if (envelope.type == "read_receipt") {
+            dao.updateOutgoingStatus(
+                senderId = currentUser.userId,
+                receiverId = envelope.sender,
+                status = MessageDeliveryStatus.READ.name
+            )
+            return
+        }
+        webRTCClient.onIncomingSignal(envelope)
     }
 
     fun startPolling() {
@@ -219,7 +1142,7 @@ class ChatRepository(
                 if (result is NetworkResult.Blocked) {
                     delay(15_000L)
                 } else {
-                    delay(4_000L)
+                    delay(3_000L)
                 }
             }
         }
@@ -236,10 +1159,9 @@ class ChatRepository(
     ) {
         val currentUser = _session.value ?: return
         if (!baselineLoaded) {
-            // Seed existing messages on initial load so user isn't flooded with old history notifications
             val existingKeys = messages.map { it.dedupeKey }.toSet()
             seenMessageKeys.addAll(existingKeys)
-            sessionStore.addNotifiedMessageIds(existingKeys)
+            sessionManager.addNotifiedMessageIds(existingKeys)
             baselineLoaded = true
             return
         }
@@ -264,7 +1186,7 @@ class ChatRepository(
         }
 
         if (newlyNotified.isNotEmpty()) {
-            sessionStore.addNotifiedMessageIds(newlyNotified)
+            sessionManager.addNotifiedMessageIds(newlyNotified)
         }
     }
 

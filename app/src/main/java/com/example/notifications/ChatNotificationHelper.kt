@@ -20,17 +20,20 @@ class ChatNotificationHelper(private val context: Context) {
 
     companion object {
         const val CHANNEL_ID = "hello_sir_messages"
+        const val CALL_CHANNEL_ID = "hello_sir_calls"
         const val EXTRA_CHAT_TARGET = "extra_chat_target"
+        const val EXTRA_OPEN_CALL = "extra_open_call"
     }
 
     init {
-        createChannel()
+        createChannels()
     }
 
-    fun createChannel() {
+    fun createChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val channel = NotificationChannel(
+
+            val msgChannel = NotificationChannel(
                 CHANNEL_ID,
                 context.getString(R.string.notification_channel_name),
                 NotificationManager.IMPORTANCE_HIGH
@@ -38,7 +41,18 @@ class ChatNotificationHelper(private val context: Context) {
                 description = context.getString(R.string.notification_channel_desc)
                 enableVibration(true)
             }
-            manager.createNotificationChannel(channel)
+            manager.createNotificationChannel(msgChannel)
+
+            val callChannel = NotificationChannel(
+                CALL_CHANNEL_ID,
+                context.getString(R.string.call_notification_channel_name),
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = context.getString(R.string.call_notification_channel_desc)
+                enableVibration(true)
+                setShowBadge(false)
+            }
+            manager.createNotificationChannel(callChannel)
         }
     }
 
@@ -69,17 +83,20 @@ class ChatNotificationHelper(private val context: Context) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val formattedActor = "$senderDisplayName (${message.sender})"
         val title = if (message.isBroadcast) {
-            "Global Broadcast • $senderDisplayName"
+            "Global Broadcast • $formattedActor"
         } else {
-            senderDisplayName
+            formattedActor
         }
+
+        val preview = message.previewSummary()
 
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification_chat)
             .setContentTitle(title)
-            .setContentText(message.text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(message.text))
+            .setContentText(preview)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(preview))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
