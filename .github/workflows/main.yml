@@ -24,10 +24,23 @@ jobs:
       with:
         gradle-version: '9.3.1'
 
-    - name: Restore debug keystore & verify SDK licenses
+    - name: Remove legacy duplicate HelloSirApi if ApiService exists
       run: |
-        if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
-          base64 -d debug.keystore.base64 > debug.keystore
+        if [ -f app/src/main/java/com/example/data/network/HelloSirApi.kt ] && [ -f app/src/main/java/com/example/data/network/ApiService.kt ]; then
+          rm -f app/src/main/java/com/example/data/network/HelloSirApi.kt
+        fi
+
+    - name: Prepare debug keystore & verify SDK licenses
+      run: |
+        if [ ! -f debug.keystore ]; then
+          if [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          else
+            keytool -genkeypair -v -keystore debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
         fi
         if [ -n "${ANDROID_HOME:-}" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
@@ -36,6 +49,7 @@ jobs:
     - name: Build Debug APK
       env:
         JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
+        GRADLE_OPTS: "-Djava.awt.headless=true"
       run: gradle assembleDebug --no-daemon -x lint -Djava.awt.headless=true -Pksp.useWorkerApi=false -PgoogleServices.missing.passthrough=true
 
     - name: Upload APK Artifact
