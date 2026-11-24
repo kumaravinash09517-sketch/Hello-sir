@@ -3,44 +3,44 @@ name: Build Android APK
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '21'
 
-      - name: Install Gradle
-        uses: gradle/actions/setup-gradle@v3
+    - name: Set up Gradle 9.3.1
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: '9.3.1'
 
-      - name: Configure Headless JVM for KSP
-        run: |
-          mkdir -p "$HOME/.gradle"
-          echo "org.gradle.jvmargs=-Xmx3072m -Djava.awt.headless=true -Dfile.encoding=UTF-8" >> "$HOME/.gradle/gradle.properties"
-          echo "org.gradle.daemon=false" >> "$HOME/.gradle/gradle.properties"
+    - name: Restore debug keystore & verify SDK licenses
+      run: |
+        if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
+          base64 -d debug.keystore.base64 > debug.keystore
+        fi
+        if [ -n "${ANDROID_HOME:-}" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+        fi
 
-      - name: Remove google-services constraint & Bypass signing check
-        run: |
-          rm -f app/google-services.json
-          find . -name "build.gradle*" -exec sed -i '/signingConfig /d' {} + || true
+    - name: Build Debug APK
+      env:
+        JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
+      run: gradle assembleDebug --no-daemon -x lint -Djava.awt.headless=true -Pksp.useWorkerApi=false -PgoogleServices.missing.passthrough=true
 
-      - name: Build APK with System Gradle
-        env:
-          JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
-        run: gradle assembleDebug --no-daemon -x lint -Pcom.google.gms.google-services.disabled=true
-
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: hello-sir-debug
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            build/outputs/apk/debug/*.apk
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: hello-sir-debug
+        path: app/build/outputs/apk/debug/*.apk
+        if-no-files-found: error
