@@ -40,10 +40,12 @@ import androidx.compose.material.icons.rounded.ChatBubbleOutline
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.FormatQuote
+import androidx.compose.material.icons.rounded.Fullscreen
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.VideoLibrary
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -100,7 +102,9 @@ fun SocialPostCard(
     onOpenComments: (SocialPost) -> Unit,
     onOpenShare: (SocialPost) -> Unit,
     onToggleBookmark: (String) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    authorAvatarUrl: String? = null,
+    onOpenFullScreen: (SocialPost) -> Unit = {}
 ) {
     var showDoubleTapHeart by remember { mutableStateOf(false) }
 
@@ -157,6 +161,7 @@ fun SocialPostCard(
                     seedKey = post.authorId,
                     size = 40.dp,
                     showPresenceDot = false,
+                    avatarUrl = authorAvatarUrl,
                     modifier = Modifier.clickable { onAuthorClick(post.authorId) }
                 )
 
@@ -225,28 +230,66 @@ fun SocialPostCard(
                             }
                         }
                         if (imageModel != null) {
-                            AsyncImage(
-                                model = imageModel,
-                                contentDescription = post.caption.ifBlank { "Photo post" },
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(min = 240.dp, max = 380.dp)
-                            )
+                            Box(modifier = Modifier.fillMaxWidth()) {
+                                AsyncImage(
+                                    model = imageModel,
+                                    contentDescription = post.caption.ifBlank { "Photo post" },
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 240.dp, max = 380.dp)
+                                )
+                                FilledIconButton(
+                                    onClick = { onOpenFullScreen(post) },
+                                    colors = IconButtonDefaults.filledIconButtonColors(
+                                        containerColor = Color.Black.copy(alpha = 0.5f),
+                                        contentColor = Color.White
+                                    ),
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(10.dp)
+                                        .size(36.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Fullscreen,
+                                        contentDescription = "View full screen",
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
                         }
                     }
 
                     SocialMediaType.REEL -> {
                         if (post.mediaUri.isNotBlank()) {
-                            SocialVideoPlayer(
-                                videoUri = post.mediaUri,
-                                isVisible = isVideoVisible,
-                                isMuted = isMuted,
-                                onToggleMute = onToggleMute,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(340.dp)
-                            )
+                            Box(modifier = Modifier.fillMaxWidth()) {
+                                SocialVideoPlayer(
+                                    videoUri = post.mediaUri,
+                                    isVisible = isVideoVisible,
+                                    isMuted = isMuted,
+                                    onToggleMute = onToggleMute,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(340.dp)
+                                )
+                                FilledIconButton(
+                                    onClick = { onOpenFullScreen(post) },
+                                    colors = IconButtonDefaults.filledIconButtonColors(
+                                        containerColor = Color.Black.copy(alpha = 0.55f),
+                                        contentColor = Color.White
+                                    ),
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .padding(12.dp)
+                                        .size(38.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Fullscreen,
+                                        contentDescription = "Open full-screen Reel",
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -262,6 +305,7 @@ fun SocialPostCard(
                                         )
                                     )
                                 )
+                                .clickable { onOpenFullScreen(post) }
                                 .padding(horizontal = 24.dp, vertical = 34.dp),
                             contentAlignment = Alignment.Center
                         ) {
@@ -405,9 +449,11 @@ fun CommentsBottomSheet(
     post: SocialPost,
     comments: List<SocialComment>,
     onDismiss: () -> Unit,
-    onAddComment: (String) -> Unit
+    onAddComment: (String) -> Unit,
+    users: List<ChatUser> = emptyList()
 ) {
     var draft by remember { mutableStateOf("") }
+    val userMap = remember(users) { users.associateBy { it.userId.lowercase() } }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -440,6 +486,7 @@ fun CommentsBottomSheet(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(comments, key = { it.id }) { comment ->
+                        val commenterAvatar = userMap[comment.authorId.lowercase()]?.avatarUrl
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(10.dp),
                             verticalAlignment = Alignment.Top
@@ -449,7 +496,8 @@ fun CommentsBottomSheet(
                                 isOnline = true,
                                 seedKey = comment.authorId,
                                 size = 32.dp,
-                                showPresenceDot = false
+                                showPresenceDot = false,
+                                avatarUrl = commenterAvatar
                             )
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
@@ -620,7 +668,8 @@ fun SharePostBottomSheet(
                             initials = user.initials,
                             isOnline = user.isOnline(),
                             seedKey = user.userId,
-                            size = 34.dp
+                            size = 34.dp,
+                            avatarUrl = user.avatarUrl
                         )
                         Text("${user.name} (@${user.userId})", modifier = Modifier.weight(1f))
                         Icon(
@@ -759,12 +808,17 @@ fun CreatePostBottomSheet(
                     .testTag("create_post_caption")
             )
 
+            val canPublish = when (selectedType) {
+                SocialMediaType.QUOTE -> caption.isNotBlank()
+                SocialMediaType.PHOTO, SocialMediaType.REEL -> pickedUri != null
+            }
+
             Button(
                 onClick = {
                     onPublish(selectedType, pickedUri, caption)
                     onDismiss()
                 },
-                enabled = caption.isNotBlank() || pickedUri != null,
+                enabled = canPublish,
                 shape = RoundedCornerShape(14.dp),
                 modifier = Modifier
                     .fillMaxWidth()

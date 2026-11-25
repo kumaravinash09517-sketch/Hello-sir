@@ -320,10 +320,22 @@ data class ActivityNotificationEntity(
     }
 }
 
+@Entity(tableName = "applied_social_actions")
+data class AppliedSocialActionEntity(
+    @PrimaryKey val actionId: String,
+    val appliedAtMs: Long = System.currentTimeMillis()
+)
+
 @Dao
 interface ChatDao {
     @Query("SELECT * FROM users")
     fun observeUsers(): Flow<List<UserEntity>>
+
+    @Query("SELECT * FROM users")
+    suspend fun getAllUsers(): List<UserEntity>
+
+    @Query("SELECT * FROM users WHERE userId = :userId LIMIT 1")
+    suspend fun getUserById(userId: String): UserEntity?
 
     @Query("SELECT * FROM messages ORDER BY timestampMs ASC")
     fun observeAllMessages(): Flow<List<MessageEntity>>
@@ -333,6 +345,9 @@ interface ChatDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertUsers(users: List<UserEntity>)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertUser(user: UserEntity)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertMessages(messages: List<MessageEntity>)
@@ -365,6 +380,9 @@ interface ChatDao {
     @Query("SELECT * FROM social_comments ORDER BY timestampMs ASC")
     fun observeAllComments(): Flow<List<SocialCommentEntity>>
 
+    @Query("SELECT * FROM social_comments WHERE id = :commentId LIMIT 1")
+    suspend fun getCommentById(commentId: String): SocialCommentEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertComment(comment: SocialCommentEntity)
 
@@ -385,6 +403,15 @@ interface ChatDao {
 
     @Query("UPDATE activity_notifications SET isRead = 1")
     suspend fun markAllActivityRead()
+
+    @Query("SELECT actionId FROM applied_social_actions")
+    suspend fun getAppliedSocialActionIds(): List<String>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun markSocialActionApplied(entry: AppliedSocialActionEntity): Long
+
+    @Query("DELETE FROM applied_social_actions")
+    suspend fun clearAppliedSocialActions()
 
     @Query("DELETE FROM users")
     suspend fun clearUsers()
@@ -416,9 +443,10 @@ interface ChatDao {
         SocialPostEntity::class,
         SocialCommentEntity::class,
         ProfileExtraEntity::class,
-        ActivityNotificationEntity::class
+        ActivityNotificationEntity::class,
+        AppliedSocialActionEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {

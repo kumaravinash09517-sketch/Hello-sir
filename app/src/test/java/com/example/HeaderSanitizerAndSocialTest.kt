@@ -239,8 +239,8 @@ class HeaderSanitizerAndSocialTest {
     @Test
     fun chatUiState_sortsActiveThreadsToTopAndSearchesWithAtPrefix() {
         val me = UserSession(userId = "me", name = "Me", deviceLockId = "DEV-1", lockedAtMs = 1L)
-        val u1 = ChatUser(userId = "ankit_01", name = "Ankit", explicitOnline = true)
-        val u2 = ChatUser(userId = "avinash", name = "अविनाश Verma", explicitOnline = false)
+        val u1 = ChatUser(userId = "ankit_01", name = "Ankit", explicitOnline = true, phone = "9876500001")
+        val u2 = ChatUser(userId = "avinash", name = "अविनाश Verma", explicitOnline = false, phone = "9876543210")
 
         val state = ChatUiState(
             session = me,
@@ -262,6 +262,75 @@ class HeaderSanitizerAndSocialTest {
 
         // Explore supports @-prefix + case-insensitive lookup
         assertEquals(listOf("avinash"), state.exploredUsers.map { it.userId })
+
+        // Phone lookup works in Explore & Chats
+        val phoneState = state.copy(exploreQuery = "543210", searchQuery = "500001")
+        assertEquals(listOf("avinash"), phoneState.exploredUsers.map { it.userId })
+        assertEquals(listOf("ankit_01"), phoneState.sortedChatUsers.map { it.userId })
+    }
+
+    @Test
+    fun parseFeed_decodesProfileAvatarRepostLikeAndFollowActions() {
+        val avatarAction = SocialActionEnvelope(
+            actionId = "ava_1",
+            actionType = "profile_avatar",
+            actorId = "priya",
+            actorName = "Priya",
+            targetUserId = "priya",
+            payloadText = "https://res.cloudinary.com/dvjhguyzo/image/upload/v1/hello_sir/priya.jpg",
+            timestampMs = 1700000010000L
+        )
+        val repostAction = SocialActionEnvelope(
+            actionId = "rep_1",
+            actionType = "repost",
+            actorId = "rohit",
+            actorName = "Rohit",
+            targetUserId = "priya",
+            postId = "post_9",
+            payloadText = "Shared reel",
+            timestampMs = 1700000011000L
+        )
+        val likeAction = SocialActionEnvelope(
+            actionId = "lik_1",
+            actionType = "like",
+            actorId = "rohit",
+            actorName = "Rohit",
+            targetUserId = "priya",
+            postId = "post_9",
+            timestampMs = 1700000012000L
+        )
+        val followAction = SocialActionEnvelope(
+            actionId = "fol_1",
+            actionType = "follow",
+            actorId = "rohit",
+            actorName = "Rohit",
+            targetUserId = "priya",
+            timestampMs = 1700000013000L
+        )
+
+        val nowSec = System.currentTimeMillis() / 1000L
+        fun esc(env: SocialActionEnvelope) = BackendJsonParser.encodeSocialAction(env).replace("\"", "\\\"")
+
+        val json = """
+            {
+              "users": [],
+              "messages": [
+                {"id": "a1", "sender": "priya", "receiver": "all", "text": "${esc(avatarAction)}", "timestamp": $nowSec},
+                {"id": "a2", "sender": "rohit", "receiver": "all", "text": "${esc(repostAction)}", "timestamp": $nowSec},
+                {"id": "a3", "sender": "rohit", "receiver": "all", "text": "${esc(likeAction)}", "timestamp": $nowSec},
+                {"id": "a4", "sender": "rohit", "receiver": "all", "text": "${esc(followAction)}", "timestamp": $nowSec}
+              ]
+            }
+        """.trimIndent()
+
+        val feed = BackendJsonParser.parseFeed(json)
+        assertTrue(feed.messages.isEmpty())
+        assertEquals(4, feed.socialActions.size)
+        assertEquals("profile_avatar", feed.socialActions[0].actionType)
+        assertEquals("https://res.cloudinary.com/dvjhguyzo/image/upload/v1/hello_sir/priya.jpg", feed.socialActions[0].payloadText)
+        assertEquals("repost", feed.socialActions[1].actionType)
+        assertEquals("like", feed.socialActions[2].actionType)
+        assertEquals("follow", feed.socialActions[3].actionType)
     }
 
     @Test

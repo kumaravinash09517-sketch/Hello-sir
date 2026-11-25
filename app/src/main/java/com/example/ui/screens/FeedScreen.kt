@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -76,6 +75,7 @@ import com.example.ui.components.DailyShayariCard
 import com.example.ui.components.HelloSirWordmark
 import com.example.ui.components.SharePostBottomSheet
 import com.example.ui.components.SocialPostCard
+import com.example.ui.components.SocialPostViewerDialog
 import com.example.ui.components.UserAvatar
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -85,6 +85,7 @@ fun FeedScreen(
     onRefresh: () -> Unit,
     onOpenActivity: () -> Unit,
     onOpenUserProfile: (String) -> Unit,
+    onOpenChat: (String) -> Unit = {},
     onToggleFollow: (String) -> Unit,
     onToggleLike: (String) -> Unit,
     onToggleBookmark: (String) -> Unit,
@@ -97,6 +98,7 @@ fun FeedScreen(
     val context = LocalContext.current
     val currentUserId = uiState.session?.userId.orEmpty()
     val listState = rememberLazyListState()
+    val userMap = remember(uiState.users) { uiState.users.associateBy { it.userId.lowercase() } }
 
     var shayariOffset by remember { mutableIntStateOf(0) }
     val todayShayari = remember(shayariOffset) { DailyShayariProvider.shayariForToday(shayariOffset) }
@@ -104,6 +106,7 @@ fun FeedScreen(
     var isMuted by remember { mutableStateOf(true) }
     var activeCommentsPostId by remember { mutableStateOf<String?>(null) }
     var activeSharePost by remember { mutableStateOf<SocialPost?>(null) }
+    var fullScreenPostId by remember { mutableStateOf<String?>(null) }
     var showCreateSheet by remember { mutableStateOf(false) }
     var createPrefillCaption by remember { mutableStateOf("") }
     var createInitialType by remember { mutableStateOf(SocialMediaType.PHOTO) }
@@ -119,12 +122,33 @@ fun FeedScreen(
         }
     }
 
+    if (fullScreenPostId != null) {
+        SocialPostViewerDialog(
+            posts = uiState.socialPosts,
+            initialPostId = fullScreenPostId!!,
+            currentUserId = currentUserId,
+            users = uiState.users,
+            commentsByPost = uiState.socialComments,
+            profileExtras = uiState.profileExtras,
+            onDismiss = { fullScreenPostId = null },
+            onOpenUserProfile = onOpenUserProfile,
+            onOpenChat = onOpenChat,
+            onToggleFollow = onToggleFollow,
+            onToggleLike = onToggleLike,
+            onToggleBookmark = onToggleBookmark,
+            onAddComment = onAddComment,
+            onRepost = onRepost,
+            onShareToChat = onShareToChat
+        )
+    }
+
     if (activeCommentsPostId != null) {
         val post = uiState.socialPosts.firstOrNull { it.id == activeCommentsPostId }
         if (post != null) {
             CommentsBottomSheet(
                 post = post,
                 comments = uiState.socialComments[post.id].orEmpty(),
+                users = uiState.users,
                 onDismiss = { activeCommentsPostId = null },
                 onAddComment = { text -> onAddComment(post.id, text) }
             )
@@ -226,7 +250,7 @@ fun FeedScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            if (uiState.isRefreshing) {
+            if (uiState.isRefreshing || uiState.isPublishingPost) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
 
@@ -285,7 +309,8 @@ fun FeedScreen(
                                             initials = user.initials,
                                             isOnline = isOnline,
                                             seedKey = user.userId,
-                                            size = 50.dp
+                                            size = 50.dp,
+                                            avatarUrl = user.avatarUrl
                                         )
                                     }
                                     Spacer(modifier = Modifier.height(4.dp))
@@ -365,6 +390,7 @@ fun FeedScreen(
                             key = { _, post -> "post_${post.id}" }
                         ) { _, post ->
                             val isFollowed = uiState.profileExtras[post.authorId]?.isFollowedByMe == true
+                            val authorAvatar = userMap[post.authorId.lowercase()]?.avatarUrl
                             SocialPostCard(
                                 post = post,
                                 currentUserId = currentUserId,
@@ -377,7 +403,9 @@ fun FeedScreen(
                                 onToggleLike = onToggleLike,
                                 onOpenComments = { activeCommentsPostId = it.id },
                                 onOpenShare = { activeSharePost = it },
-                                onToggleBookmark = onToggleBookmark
+                                onToggleBookmark = onToggleBookmark,
+                                authorAvatarUrl = authorAvatar,
+                                onOpenFullScreen = { fullScreenPostId = it.id }
                             )
                         }
                     }

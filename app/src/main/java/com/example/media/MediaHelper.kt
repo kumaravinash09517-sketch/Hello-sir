@@ -54,10 +54,10 @@ object MediaHelper {
             else -> MessageKind.DOCUMENT
         }
 
-        val inlineBase64 = if (kind == MessageKind.IMAGE) {
-            encodeCompactImageThumbnail(context, uri)
-        } else {
-            ""
+        val inlineBase64 = when (kind) {
+            MessageKind.IMAGE -> encodeCompactImageThumbnail(context, uri)
+            MessageKind.VIDEO -> encodeCompactVideoThumbnail(context, uri)
+            else -> ""
         }
 
         return MediaPayload(
@@ -68,6 +68,42 @@ object MediaHelper {
             localUri = uri.toString(),
             inlineDataBase64 = inlineBase64
         )
+    }
+
+    private fun encodeCompactVideoThumbnail(context: Context, uri: Uri): String {
+        return runCatching {
+            val retriever = android.media.MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(context, uri)
+                val frame = retriever.getFrameAtTime(
+                    500_000L,
+                    android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                ) ?: retriever.frameAtTime ?: return@runCatching ""
+                val maxDim = 280
+                val ratio = minOf(
+                    maxDim.toFloat() / frame.width.coerceAtLeast(1),
+                    maxDim.toFloat() / frame.height.coerceAtLeast(1),
+                    1f
+                )
+                val scaled = if (ratio < 1f) {
+                    Bitmap.createScaledBitmap(
+                        frame,
+                        (frame.width * ratio).toInt().coerceAtLeast(1),
+                        (frame.height * ratio).toInt().coerceAtLeast(1),
+                        true
+                    )
+                } else {
+                    frame
+                }
+                val out = ByteArrayOutputStream()
+                scaled.compress(Bitmap.CompressFormat.JPEG, 58, out)
+                if (scaled != frame) scaled.recycle()
+                frame.recycle()
+                Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+            } finally {
+                runCatching { retriever.release() }
+            }
+        }.getOrDefault("")
     }
 
     private fun encodeCompactImageThumbnail(context: Context, uri: Uri): String {

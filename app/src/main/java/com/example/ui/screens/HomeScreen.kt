@@ -221,12 +221,16 @@ private fun UserDirectoryPane(
                             .take(2)
                             .joinToString("") { it.first().uppercaseChar().toString() }
                             .ifBlank { currentUserId.take(2).uppercase() }
+                        val myAvatarUrl = uiState.users
+                            .firstOrNull { it.userId.equals(currentUserId, ignoreCase = true) }
+                            ?.avatarUrl
 
                         UserAvatar(
                             initials = initials,
                             isOnline = true,
                             seedKey = currentUserId,
-                            size = 38.dp
+                            size = 38.dp,
+                            avatarUrl = myAvatarUrl
                         )
                         Column {
                             Text(

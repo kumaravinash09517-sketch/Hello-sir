@@ -90,6 +90,7 @@ class SignalingClient(
         pollJob = null
         webSocket?.close(1000, "Session ended")
         webSocket = null
+        processedSignalIds.clear()
         _transportState.value = SignalingTransportState.DISCONNECTED
     }
 
@@ -138,6 +139,7 @@ class SignalingClient(
     private fun startCallPolling(userId: String) {
         pollJob?.cancel()
         pollJob = scope.launch {
+            var tick = 0
             while (isActive && !isStopped && currentUserId == userId) {
                 runCatching {
                     val response = apiService.pollCallSignals(userId)
@@ -152,6 +154,10 @@ class SignalingClient(
                         onRestSignalsReceived(signals)
                     }
                 }
+                if (tick % 3 == 1) {
+                    fetchActiveCalls(userId)
+                }
+                tick++
                 delay(1_800L)
             }
         }
@@ -213,8 +219,12 @@ class SignalingClient(
     }
 
     private fun dispatchIfNew(envelope: SignalingEnvelope) {
-        val ageMs = System.currentTimeMillis() - envelope.timestampMs
-        if (envelope.type == "offer" && ageMs > 45_000L) {
+        val ageMs = if (envelope.timestampMs > 0L) {
+            System.currentTimeMillis() - envelope.timestampMs
+        } else {
+            0L
+        }
+        if (envelope.type == "offer" && ageMs > 90_000L) {
             processedSignalIds.add(envelope.signalId)
             return
         }

@@ -3,6 +3,7 @@ package com.example.data
 import android.content.Context
 import android.net.Uri
 import com.example.data.local.ActivityNotificationEntity
+import com.example.data.local.AppliedSocialActionEntity
 import com.example.data.local.ChatDatabase
 import com.example.data.local.MessageEntity
 import com.example.data.local.ProfileExtraEntity
@@ -30,6 +31,7 @@ import com.example.data.model.SocialPost
 import com.example.data.model.UserProfileExtras
 import com.example.data.model.UserSession
 import com.example.data.network.ApiService
+import com.example.data.network.BackendConfig
 import com.example.data.network.BackendJsonParser
 import com.example.data.network.MediaUploadService
 import com.example.data.network.RetrofitClient
@@ -45,6 +47,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -57,6 +62,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -144,6 +151,7 @@ class ChatRepository(
 
         scope.launch {
             seenMessageKeys.addAll(sessionManager.getNotifiedMessageIds())
+            processedSocialActionIds.addAll(dao.getAppliedSocialActionIds())
 
             launch {
                 signalingClient.incomingSignals.collect { envelope ->
@@ -308,12 +316,35 @@ class ChatRepository(
                 found += BackendJsonParser.parseUsers(findResp.body()?.string().orEmpty())
             }
         }
-
-        val deduped = found.distinctBy { it.userId }
-        if (deduped.isNotEmpty()) {
-            dao.upsertUsers(deduped.map { UserEntity.fromDomain(it) })
+        if (supabaseClient.isConfigured()) {
+            found += supabaseClient.searchUsers(clean)
         }
-        return deduped
+
+        val existingMap = dao.getAllUsers().associateBy { it.userId.lowercase(Locale.US) }
+        val merged = mergeUserLists(found, existingMap)
+        if (merged.isNotEmpty()) {
+            dao.upsertUsers(merged.map { UserEntity.fromDomain(it) })
+            syncUserBiosToExtras(merged)
+        }
+        return merged
+    }
+
+    suspend fun fetchAndCacheUser(userId: String) {
+        val clean = userId.trim().removePrefix("@")
+        if (clean.isEmpty()) return
+        val found = mutableListOf<ChatUser>()
+        runCatching {
+            val resp = api.findUser(userId = clean, userIdSnake = clean, username = clean)
+            if (resp.isSuccessful) {
+                found += BackendJsonParser.parseUsers(resp.body()?.string().orEmpty())
+            }
+        }
+        if (found.isNotEmpty()) {
+            val existingMap = dao.getAllUsers().associateBy { it.userId.lowercase(Locale.US) }
+            val merged = mergeUserLists(found, existingMap)
+            dao.upsertUsers(merged.map { UserEntity.fromDomain(it) })
+            syncUserBiosToExtras(merged)
+        }
     }
 
     suspend fun refreshFeed(): NetworkResult<FeedPayload> {
@@ -346,60 +377,67 @@ class ChatRepository(
                 allUsers += supabaseClient.fetchUsers()
             }
 
-            val dedupedUsers = allUsers
-                .filter { it.userId.isNotBlank() }
-                .associateBy { it.userId }
-                .values
-                .toList()
+            val existingMap = dao.getAllUsers().associateBy { it.userId.lowercase(Locale.US) }
+            val dedupedUsers = mergeUserLists(allUsers, existingMap)
 
             if (dedupedUsers.isNotEmpty()) {
                 dao.upsertUsers(dedupedUsers.map { UserEntity.fromDomain(it) })
-                dedupedUsers.forEach { u ->
-                    if (!u.bio.isNullOrBlank()) {
-                        val existing = dao.getProfileExtra(u.userId)?.toDomain()
-                            ?: UserProfileExtras(userId = u.userId)
-                        dao.upsertProfileExtra(ProfileExtraEntity.fromDomain(existing.copy(bio = u.bio)))
-                    }
-                }
+                syncUserBiosToExtras(dedupedUsers)
             }
 
-            // 2. Determine peer message endpoints to fetch via /api/messages/<peer_id>?userId=<me>
+            // 2. Poll global broadcast ("all"), active chat, and ALL peer threads in bounded parallel batches
             val peerIdsToPoll = linkedSetOf(BROADCAST_TARGET_ID)
             activePeerTarget?.takeIf { it.isNotBlank() }?.let { peerIdsToPoll.add(it) }
-            val existingUsers = dedupedUsers.ifEmpty { dao.observeUsers().first().map { it.toDomain() } }
+            val existingUsers = dedupedUsers.ifEmpty { dao.getAllUsers().map { it.toDomain() } }
             existingUsers
                 .filterNot { it.userId.equals(currentUser.userId, ignoreCase = true) }
                 .sortedByDescending { it.lastSeenEpochMs ?: 0L }
-                .take(6)
                 .forEach { peerIdsToPoll.add(it.userId) }
 
-            val collectedMessages = mutableListOf<ChatMessage>()
-            val collectedSignals = mutableListOf<SignalingEnvelope>()
-            val collectedPosts = mutableListOf<SocialPost>()
-            val collectedActions = mutableListOf<SocialActionEnvelope>()
+            val collectedMessages = Collections.synchronizedList(mutableListOf<ChatMessage>())
+            val collectedSignals = Collections.synchronizedList(mutableListOf<SignalingEnvelope>())
+            val collectedPosts = Collections.synchronizedList(mutableListOf<SocialPost>())
+            val collectedActions = Collections.synchronizedList(mutableListOf<SocialActionEnvelope>())
 
             collectedMessages += parsedUsersFeed.messages
             collectedSignals += parsedUsersFeed.signals
             collectedPosts += parsedUsersFeed.posts
             collectedActions += parsedUsersFeed.socialActions
 
-            for (peerId in peerIdsToPoll) {
-                val msgResp = runCatching {
-                    api.getMessagesWithPeer(peerId = peerId, userId = currentUser.userId)
-                }.getOrNull() ?: continue
+            if (supabaseClient.isConfigured()) {
+                collectedPosts += supabaseClient.fetchSocialPosts()
+            }
 
-                if (msgResp.code() == 403) {
-                    _blockedEvents.tryEmit(BLOCKED_MESSAGE)
-                    return NetworkResult.Blocked(BLOCKED_MESSAGE)
-                }
-                if (msgResp.isSuccessful) {
-                    val bodyStr = msgResp.body()?.string().orEmpty()
-                    val feed = BackendJsonParser.parseFeed(bodyStr)
-                    collectedMessages += feed.messages
-                    collectedSignals += feed.signals
-                    collectedPosts += feed.posts
-                    collectedActions += feed.socialActions
-                }
+            var blockedByPeerPoll = false
+            val semaphore = Semaphore(4)
+            coroutineScope {
+                peerIdsToPoll.map { peerId ->
+                    async {
+                        semaphore.withPermit {
+                            val msgResp = runCatching {
+                                api.getMessagesWithPeer(peerId = peerId, userId = currentUser.userId)
+                            }.getOrNull() ?: return@withPermit
+
+                            if (msgResp.code() == 403) {
+                                blockedByPeerPoll = true
+                                return@withPermit
+                            }
+                            if (msgResp.isSuccessful) {
+                                val bodyStr = msgResp.body()?.string().orEmpty()
+                                val feed = BackendJsonParser.parseFeed(bodyStr)
+                                collectedMessages += feed.messages
+                                collectedSignals += feed.signals
+                                collectedPosts += feed.posts
+                                collectedActions += feed.socialActions
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            if (blockedByPeerPoll) {
+                _blockedEvents.tryEmit(BLOCKED_MESSAGE)
+                return NetworkResult.Blocked(BLOCKED_MESSAGE)
             }
 
             if (collectedSignals.isNotEmpty()) {
@@ -414,7 +452,9 @@ class ChatRepository(
                 dao.insertSocialPostsIfAbsent(finalPosts.map { SocialPostEntity.fromDomain(it) })
             }
             if (collectedActions.isNotEmpty()) {
-                applyIncomingSocialActions(collectedActions.distinctBy { it.actionId })
+                applyIncomingSocialActions(
+                    collectedActions.distinctBy { it.actionId }.sortedBy { it.timestampMs }
+                )
             }
 
             _lastSyncMs.value = System.currentTimeMillis()
@@ -425,9 +465,9 @@ class ChatRepository(
                 FeedPayload(
                     users = dedupedUsers,
                     messages = finalMessages,
-                    signals = collectedSignals,
+                    signals = collectedSignals.toList(),
                     posts = finalPosts,
-                    socialActions = collectedActions
+                    socialActions = collectedActions.toList()
                 )
             )
         } catch (e: SocketTimeoutException) {
@@ -442,6 +482,49 @@ class ChatRepository(
             val msg = e.localizedMessage ?: "Failed to parse server response."
             _syncError.value = msg
             NetworkResult.Error(msg)
+        }
+    }
+
+    private fun mergeUserLists(
+        incoming: List<ChatUser>,
+        existingMap: Map<String, UserEntity>
+    ): List<ChatUser> {
+        val mergedById = linkedMapOf<String, ChatUser>()
+        for (user in incoming) {
+            if (user.userId.isBlank()) continue
+            val key = user.userId.lowercase(Locale.US)
+            val prev = mergedById[key] ?: existingMap[key]?.toDomain()
+            mergedById[key] = if (prev == null) {
+                user
+            } else {
+                ChatUser(
+                    userId = user.userId,
+                    name = user.name.ifBlank { prev.name },
+                    lastSeenEpochMs = maxOfNullable(user.lastSeenEpochMs, prev.lastSeenEpochMs),
+                    explicitOnline = user.explicitOnline ?: prev.explicitOnline,
+                    statusText = user.statusText ?: prev.statusText,
+                    avatarUrl = user.avatarUrl?.takeIf { it.isNotBlank() } ?: prev.avatarUrl,
+                    bio = user.bio?.takeIf { it.isNotBlank() } ?: prev.bio,
+                    phone = user.phone?.takeIf { it.isNotBlank() } ?: prev.phone
+                )
+            }
+        }
+        return mergedById.values.toList()
+    }
+
+    private fun maxOfNullable(a: Long?, b: Long?): Long? = when {
+        a != null && b != null -> maxOf(a, b)
+        a != null -> a
+        else -> b
+    }
+
+    private suspend fun syncUserBiosToExtras(users: List<ChatUser>) {
+        for (u in users) {
+            val incomingBio = u.bio?.takeIf { it.isNotBlank() } ?: continue
+            val existing = dao.getProfileExtra(u.userId)?.toDomain() ?: UserProfileExtras(userId = u.userId)
+            if (existing.bio != incomingBio) {
+                dao.upsertProfileExtra(ProfileExtraEntity.fromDomain(existing.copy(bio = incomingBio)))
+            }
         }
     }
 
@@ -641,6 +724,11 @@ class ChatRepository(
 
     // ==================== Social Media Actions ====================
 
+    private suspend fun recordActionId(actionId: String) {
+        processedSocialActionIds.add(actionId)
+        dao.markSocialActionApplied(AppliedSocialActionEntity(actionId))
+    }
+
     suspend fun createSocialPost(
         mediaType: SocialMediaType,
         mediaUri: Uri?,
@@ -648,29 +736,49 @@ class ChatRepository(
         shayariTag: String = ""
     ): NetworkResult<SocialPost> {
         val me = _session.value ?: return NetworkResult.Error("Not logged in.")
-        val mediaPayload = mediaUri?.let {
+        var resolvedRemoteUrl = ""
+        var compactThumbnailBase64 = ""
+
+        if (mediaUri != null) {
             val forced = when (mediaType) {
                 SocialMediaType.PHOTO -> MessageKind.IMAGE
                 SocialMediaType.REEL -> MessageKind.VIDEO
                 SocialMediaType.QUOTE -> null
             }
-            val inspected = MediaHelper.inspectPickedUri(appContext, it, forced)
+            val inspected = MediaHelper.inspectPickedUri(appContext, mediaUri, forced)
             val uploaded = mediaUploadService.uploadUri(
-                uri = it,
+                uri = mediaUri,
                 fileName = inspected.displayName,
                 mimeType = inspected.mimeType,
                 userId = me.userId,
                 mediaTypeTag = mediaType.name.lowercase(Locale.US)
             )
-            if (uploaded != null) inspected.copy(localUri = uploaded.remoteUrl) else inspected
+
+            if (mediaType == SocialMediaType.REEL) {
+                if (uploaded == null || uploaded.remoteUrl.isBlank()) {
+                    return NetworkResult.Error("Reel video upload failed. Check internet connection and try again.")
+                }
+                resolvedRemoteUrl = uploaded.remoteUrl
+                compactThumbnailBase64 = inspected.inlineDataBase64
+            } else if (mediaType == SocialMediaType.PHOTO) {
+                if (uploaded != null && uploaded.remoteUrl.isNotBlank()) {
+                    resolvedRemoteUrl = uploaded.remoteUrl
+                    compactThumbnailBase64 = ""
+                } else if (inspected.inlineDataBase64.isNotBlank()) {
+                    compactThumbnailBase64 = inspected.inlineDataBase64
+                } else {
+                    return NetworkResult.Error("Photo upload failed. Please try another photo.")
+                }
+            }
         }
+
         val post = SocialPost(
             id = "post_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}",
             authorId = me.userId,
             authorName = me.name,
             mediaType = mediaType,
-            mediaUri = mediaPayload?.localUri.orEmpty(),
-            inlineImageBase64 = mediaPayload?.inlineDataBase64.orEmpty(),
+            mediaUri = resolvedRemoteUrl,
+            inlineImageBase64 = compactThumbnailBase64,
             caption = caption.trim(),
             shayariTag = shayariTag.trim(),
             timestampMs = System.currentTimeMillis(),
@@ -679,8 +787,23 @@ class ChatRepository(
         dao.upsertSocialPost(SocialPostEntity.fromDomain(post))
 
         val wire = BackendJsonParser.encodePost(post)
-        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, wire, mediaPayload?.localUri)
-        return NetworkResult.Success(post)
+        val sendResult = sendSocialWireEnvelope(
+            sender = me.userId,
+            receiver = BROADCAST_TARGET_ID,
+            wireText = wire,
+            mediaUrl = resolvedRemoteUrl.takeIf { it.isNotBlank() }
+        )
+        if (supabaseClient.isConfigured()) {
+            scope.launch { supabaseClient.upsertSocialPost(post) }
+        }
+        return when (sendResult) {
+            is NetworkResult.Blocked -> sendResult
+            is NetworkResult.Error -> {
+                // Keep locally visible while informing caller that server sync failed
+                NetworkResult.Error(sendResult.message)
+            }
+            is NetworkResult.Success -> NetworkResult.Success(post)
+        }
     }
 
     suspend fun toggleLikePost(postId: String) {
@@ -694,23 +817,6 @@ class ChatRepository(
         )
         dao.upsertSocialPost(SocialPostEntity.fromDomain(updated))
 
-        if (nowLiked) {
-            dao.insertActivityNotification(
-                ActivityNotificationEntity.fromDomain(
-                    ActivityNotification(
-                        id = "act_like_${postId}_${me.userId}",
-                        type = ActivityType.LIKE,
-                        actorId = me.userId,
-                        actorName = me.name,
-                        postId = postId,
-                        postSnippet = existing.caption.take(48),
-                        timestampMs = System.currentTimeMillis(),
-                        isRead = existing.authorId.equals(me.userId, ignoreCase = true)
-                    )
-                )
-            )
-        }
-
         val action = SocialActionEnvelope(
             actionId = "act_${UUID.randomUUID()}",
             actionType = if (nowLiked) "like" else "unlike",
@@ -719,7 +825,7 @@ class ChatRepository(
             targetUserId = existing.authorId,
             postId = postId
         )
-        processedSocialActionIds.add(action.actionId)
+        recordActionId(action.actionId)
         sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
     }
 
@@ -734,8 +840,9 @@ class ChatRepository(
         val clean = text.trim()
         if (clean.isEmpty()) return
         val now = System.currentTimeMillis()
+        val commentId = "cmt_${now}_${UUID.randomUUID().toString().take(6)}"
         val comment = SocialComment(
-            id = "cmt_${now}_${UUID.randomUUID().toString().take(6)}",
+            id = commentId,
             postId = postId,
             authorId = me.userId,
             authorName = me.name,
@@ -754,24 +861,10 @@ class ChatRepository(
                     )
                 )
             )
-            dao.insertActivityNotification(
-                ActivityNotificationEntity.fromDomain(
-                    ActivityNotification(
-                        id = "act_${comment.id}",
-                        type = ActivityType.COMMENT,
-                        actorId = me.userId,
-                        actorName = me.name,
-                        postId = postId,
-                        postSnippet = clean.take(60),
-                        timestampMs = now,
-                        isRead = existing.authorId.equals(me.userId, ignoreCase = true)
-                    )
-                )
-            )
         }
 
         val action = SocialActionEnvelope(
-            actionId = "act_${comment.id}",
+            actionId = commentId,
             actionType = "comment",
             actorId = me.userId,
             actorName = me.name,
@@ -780,7 +873,7 @@ class ChatRepository(
             payloadText = clean,
             timestampMs = now
         )
-        processedSocialActionIds.add(action.actionId)
+        recordActionId(action.actionId)
         sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
     }
 
@@ -811,21 +904,24 @@ class ChatRepository(
             repostedFromName = original.authorName
         )
         dao.upsertSocialPost(SocialPostEntity.fromDomain(repost))
-        dao.insertActivityNotification(
-            ActivityNotificationEntity.fromDomain(
-                ActivityNotification(
-                    id = "act_${repost.id}",
-                    type = ActivityType.REPOST,
-                    actorId = me.userId,
-                    actorName = me.name,
-                    postId = original.id,
-                    postSnippet = original.caption.take(48),
-                    timestampMs = now,
-                    isRead = original.authorId.equals(me.userId, ignoreCase = true)
-                )
-            )
+        sendSocialWireEnvelope(
+            me.userId,
+            BROADCAST_TARGET_ID,
+            BackendJsonParser.encodePost(repost),
+            repost.mediaUri.takeIf { it.startsWith("http", true) }
         )
-        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodePost(repost))
+        val repostAction = SocialActionEnvelope(
+            actionId = "rep_${repost.id}",
+            actionType = "repost",
+            actorId = me.userId,
+            actorName = me.name,
+            targetUserId = original.authorId,
+            postId = original.id,
+            payloadText = original.caption.take(48),
+            timestampMs = now
+        )
+        recordActionId(repostAction.actionId)
+        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(repostAction))
     }
 
     suspend fun toggleFollowUser(targetUserId: String) {
@@ -856,22 +952,6 @@ class ChatRepository(
             )
         )
 
-        if (nowFollowing) {
-            dao.insertActivityNotification(
-                ActivityNotificationEntity.fromDomain(
-                    ActivityNotification(
-                        id = "act_follow_${me.userId}_${targetUserId}",
-                        type = ActivityType.FOLLOW,
-                        actorId = me.userId,
-                        actorName = me.name,
-                        postSnippet = "Started following @$targetUserId",
-                        timestampMs = System.currentTimeMillis(),
-                        isRead = false
-                    )
-                )
-            )
-        }
-
         val action = SocialActionEnvelope(
             actionId = "act_${UUID.randomUUID()}",
             actionType = if (nowFollowing) "follow" else "unfollow",
@@ -879,25 +959,70 @@ class ChatRepository(
             actorName = me.name,
             targetUserId = targetUserId
         )
-        processedSocialActionIds.add(action.actionId)
+        recordActionId(action.actionId)
         sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
     }
 
-    suspend fun updateMyBio(newBio: String) {
-        val me = _session.value ?: return
-        val clean = newBio.trim()
-        val existing = dao.getProfileExtra(me.userId)?.toDomain()
+    suspend fun updateMyBio(newBio: String): NetworkResult<Unit> {
+        return updateMyProfile(newBio = newBio, avatarUri = null)
+    }
+
+    suspend fun updateMyAvatar(avatarUri: Uri): NetworkResult<Unit> {
+        return updateMyProfile(newBio = null, avatarUri = avatarUri)
+    }
+
+    suspend fun updateMyProfile(newBio: String?, avatarUri: Uri?): NetworkResult<Unit> {
+        val me = _session.value ?: return NetworkResult.Error("Not logged in.")
+        val cleanBio = newBio?.trim()
+
+        var uploadedAvatarUrl: String? = null
+        if (avatarUri != null) {
+            val inspected = MediaHelper.inspectPickedUri(appContext, avatarUri, MessageKind.IMAGE)
+            val uploaded = mediaUploadService.uploadUri(
+                uri = avatarUri,
+                fileName = inspected.displayName.ifBlank { "avatar_${me.userId}.jpg" },
+                mimeType = inspected.mimeType,
+                userId = me.userId,
+                mediaTypeTag = "avatar"
+            )
+            if (uploaded == null || uploaded.remoteUrl.isBlank()) {
+                return NetworkResult.Error("Profile photo upload failed. Check internet and try again.")
+            }
+            uploadedAvatarUrl = uploaded.remoteUrl
+        }
+
+        val existingExtra = dao.getProfileExtra(me.userId)?.toDomain()
             ?: UserProfileExtras(userId = me.userId)
-        dao.upsertProfileExtra(
-            ProfileExtraEntity.fromDomain(existing.copy(bio = clean))
+        val effectiveBio = cleanBio ?: existingExtra.bio
+
+        if (cleanBio != null) {
+            dao.upsertProfileExtra(
+                ProfileExtraEntity.fromDomain(existingExtra.copy(bio = cleanBio))
+            )
+        }
+
+        val existingUser = dao.getUserById(me.userId)?.toDomain()
+            ?: ChatUser(userId = me.userId, name = me.name, phone = me.phone.takeIf { it.isNotBlank() })
+        val effectiveAvatar = uploadedAvatarUrl ?: existingUser.avatarUrl.orEmpty()
+        dao.upsertUser(
+            UserEntity.fromDomain(
+                existingUser.copy(
+                    avatarUrl = effectiveAvatar.takeIf { it.isNotBlank() },
+                    bio = effectiveBio
+                )
+            )
         )
 
-        // Update profile on Render (/api/users/profile) and Supabase REST
         val profileJson = JSONObject().apply {
             put("user_id", me.userId)
             put("userId", me.userId)
+            put("username", me.userId)
             put("name", me.name)
-            put("bio", clean)
+            put("bio", effectiveBio)
+            if (effectiveAvatar.isNotBlank()) {
+                put("avatar_url", effectiveAvatar)
+                put("avatarUrl", effectiveAvatar)
+            }
             if (me.phone.isNotBlank()) put("phone", me.phone)
         }.toString()
 
@@ -913,20 +1038,36 @@ class ChatRepository(
                 name = me.name,
                 phone = me.phone,
                 deviceId = me.deviceLockId,
-                bio = clean
+                bio = effectiveBio,
+                avatarUrl = effectiveAvatar
             )
         }
 
-        val action = SocialActionEnvelope(
-            actionId = "bio_${UUID.randomUUID()}",
-            actionType = "profile_bio",
-            actorId = me.userId,
-            actorName = me.name,
-            targetUserId = me.userId,
-            payloadText = clean
-        )
-        processedSocialActionIds.add(action.actionId)
-        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
+        if (cleanBio != null) {
+            val bioAction = SocialActionEnvelope(
+                actionId = "bio_${UUID.randomUUID()}",
+                actionType = "profile_bio",
+                actorId = me.userId,
+                actorName = me.name,
+                targetUserId = me.userId,
+                payloadText = cleanBio
+            )
+            recordActionId(bioAction.actionId)
+            sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(bioAction))
+        }
+        if (uploadedAvatarUrl != null) {
+            val avatarAction = SocialActionEnvelope(
+                actionId = "avt_${UUID.randomUUID()}",
+                actionType = "profile_avatar",
+                actorId = me.userId,
+                actorName = me.name,
+                targetUserId = me.userId,
+                payloadText = uploadedAvatarUrl
+            )
+            recordActionId(avatarAction.actionId)
+            sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(avatarAction))
+        }
+        return NetworkResult.Success(Unit)
     }
 
     suspend fun markAllActivityRead() {
@@ -938,7 +1079,7 @@ class ChatRepository(
         receiver: String,
         wireText: String,
         mediaUrl: String? = null
-    ) {
+    ): NetworkResult<Unit> {
         val json = JSONObject().apply {
             put("sender_id", sender)
             put("senderId", sender)
@@ -953,15 +1094,24 @@ class ChatRepository(
                 put("media_url", mediaUrl)
                 put("mediaUrl", mediaUrl)
             }
-            put("msg_type", "social")
-            put("type", "social")
+            put("msg_type", "text")
+            put("type", "text")
             put("timestamp", System.currentTimeMillis())
         }.toString()
-        runCatching {
+        return try {
             val resp = api.sendMessage(json.toRequestBody(jsonMediaType))
-            if (resp.code() == 403) {
-                _blockedEvents.tryEmit(BLOCKED_MESSAGE)
+            when {
+                resp.code() == 403 -> {
+                    _blockedEvents.tryEmit(BLOCKED_MESSAGE)
+                    NetworkResult.Blocked(BLOCKED_MESSAGE)
+                }
+                resp.isSuccessful -> NetworkResult.Success(Unit)
+                else -> NetworkResult.Error("Server sync failed (${resp.code()}).")
             }
+        } catch (e: IOException) {
+            NetworkResult.Error("Saved locally; server unreachable right now.")
+        } catch (e: Exception) {
+            NetworkResult.Error(e.localizedMessage ?: "Failed to sync with server.")
         }
     }
 
@@ -969,21 +1119,26 @@ class ChatRepository(
         val me = _session.value ?: return
         for (action in actions) {
             if (!processedSocialActionIds.add(action.actionId)) continue
-            if (action.actorId.equals(me.userId, ignoreCase = true)) continue
+            val inserted = dao.markSocialActionApplied(AppliedSocialActionEntity(action.actionId))
+            if (inserted == -1L) continue
+
+            val isMine = action.actorId.equals(me.userId, ignoreCase = true)
 
             when (action.actionType) {
                 "like", "unlike" -> {
                     val post = dao.getPostById(action.postId)?.toDomain() ?: continue
-                    val delta = if (action.actionType == "like") 1 else -1
+                    val isLike = action.actionType == "like"
+                    val delta = if (isLike) 1 else -1
                     dao.upsertSocialPost(
                         SocialPostEntity.fromDomain(
                             post.copy(
                                 likeCount = (post.likeCount + delta).coerceAtLeast(0),
-                                reachCount = post.reachCount + if (delta > 0) 1 else 0
+                                reachCount = post.reachCount + if (delta > 0) 1 else 0,
+                                isLikedByMe = if (isMine) isLike else post.isLikedByMe
                             )
                         )
                     )
-                    if (action.actionType == "like" && post.authorId.equals(me.userId, ignoreCase = true)) {
+                    if (isLike && !isMine && post.authorId.equals(me.userId, ignoreCase = true)) {
                         dao.insertActivityNotification(
                             ActivityNotificationEntity.fromDomain(
                                 ActivityNotification(
@@ -1001,6 +1156,7 @@ class ChatRepository(
                 }
 
                 "comment" -> {
+                    val existingComment = dao.getCommentById(action.actionId)
                     dao.insertComment(
                         SocialCommentEntity(
                             id = action.actionId,
@@ -1012,7 +1168,7 @@ class ChatRepository(
                         )
                     )
                     val post = dao.getPostById(action.postId)?.toDomain()
-                    if (post != null) {
+                    if (post != null && existingComment == null) {
                         dao.upsertSocialPost(
                             SocialPostEntity.fromDomain(
                                 post.copy(
@@ -1021,7 +1177,7 @@ class ChatRepository(
                                 )
                             )
                         )
-                        if (post.authorId.equals(me.userId, ignoreCase = true)) {
+                        if (!isMine && post.authorId.equals(me.userId, ignoreCase = true)) {
                             dao.insertActivityNotification(
                                 ActivityNotificationEntity.fromDomain(
                                     ActivityNotification(
@@ -1039,18 +1195,60 @@ class ChatRepository(
                     }
                 }
 
-                "follow", "unfollow" -> {
-                    val delta = if (action.actionType == "follow") 1 else -1
-                    val targetExtra = dao.getProfileExtra(action.targetUserId)?.toDomain()
-                        ?: UserProfileExtras(userId = action.targetUserId)
-                    dao.upsertProfileExtra(
-                        ProfileExtraEntity.fromDomain(
-                            targetExtra.copy(
-                                followersCount = (targetExtra.followersCount + delta).coerceAtLeast(0)
+                "repost" -> {
+                    val post = dao.getPostById(action.postId)?.toDomain() ?: continue
+                    dao.upsertSocialPost(
+                        SocialPostEntity.fromDomain(
+                            post.copy(
+                                shareCount = post.shareCount + 1,
+                                reachCount = post.reachCount + 3
                             )
                         )
                     )
-                    if (action.actionType == "follow" &&
+                    if (!isMine && post.authorId.equals(me.userId, ignoreCase = true)) {
+                        dao.insertActivityNotification(
+                            ActivityNotificationEntity.fromDomain(
+                                ActivityNotification(
+                                    id = action.actionId,
+                                    type = ActivityType.REPOST,
+                                    actorId = action.actorId,
+                                    actorName = action.actorName,
+                                    postId = post.id,
+                                    postSnippet = action.payloadText.take(48),
+                                    timestampMs = action.timestampMs
+                                )
+                            )
+                        )
+                    }
+                }
+
+                "follow", "unfollow" -> {
+                    val isFollow = action.actionType == "follow"
+                    val delta = if (isFollow) 1 else -1
+                    if (action.targetUserId.isNotBlank()) {
+                        val targetExtra = dao.getProfileExtra(action.targetUserId)?.toDomain()
+                            ?: UserProfileExtras(userId = action.targetUserId)
+                        dao.upsertProfileExtra(
+                            ProfileExtraEntity.fromDomain(
+                                targetExtra.copy(
+                                    followersCount = (targetExtra.followersCount + delta).coerceAtLeast(0),
+                                    isFollowedByMe = if (isMine) isFollow else targetExtra.isFollowedByMe
+                                )
+                            )
+                        )
+                    }
+                    if (action.actorId.isNotBlank()) {
+                        val actorExtra = dao.getProfileExtra(action.actorId)?.toDomain()
+                            ?: UserProfileExtras(userId = action.actorId)
+                        dao.upsertProfileExtra(
+                            ProfileExtraEntity.fromDomain(
+                                actorExtra.copy(
+                                    followingCount = (actorExtra.followingCount + delta).coerceAtLeast(0)
+                                )
+                            )
+                        )
+                    }
+                    if (isFollow && !isMine &&
                         action.targetUserId.equals(me.userId, ignoreCase = true)
                     ) {
                         dao.insertActivityNotification(
@@ -1074,6 +1272,18 @@ class ChatRepository(
                     dao.upsertProfileExtra(
                         ProfileExtraEntity.fromDomain(extra.copy(bio = action.payloadText))
                     )
+                    dao.getUserById(action.actorId)?.let { u ->
+                        dao.upsertUser(u.copy(bio = action.payloadText))
+                    }
+                }
+
+                "profile_avatar" -> {
+                    val resolvedUrl = BackendConfig.resolveUploadUrl(action.payloadText)
+                    if (resolvedUrl.isNotBlank()) {
+                        val existingUser = dao.getUserById(action.actorId)?.toDomain()
+                            ?: ChatUser(userId = action.actorId, name = action.actorName)
+                        dao.upsertUser(UserEntity.fromDomain(existingUser.copy(avatarUrl = resolvedUrl)))
+                    }
                 }
             }
         }
@@ -1109,6 +1319,8 @@ class ChatRepository(
         webRTCClient.cleanupCallResources()
         baselineLoaded = false
         activePeerTarget = null
+        seenMessageKeys.clear()
+        processedSocialActionIds.clear()
         _syncError.value = null
         dao.clearUsers()
         dao.clearMessages()
@@ -1117,6 +1329,7 @@ class ChatRepository(
         dao.clearSocialComments()
         dao.clearProfileExtras()
         dao.clearActivityNotifications()
+        dao.clearAppliedSocialActions()
         sessionManager.resetSessionLock()
         _session.value = null
     }

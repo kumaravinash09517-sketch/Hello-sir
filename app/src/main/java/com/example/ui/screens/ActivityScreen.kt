@@ -64,6 +64,7 @@ fun ActivityScreen(
     BackHandler(onBack = onBack)
 
     val myUserId = uiState.session?.userId.orEmpty()
+    val userMap = remember(uiState.users) { uiState.users.associateBy { it.userId.lowercase() } }
     val myPosts = remember(uiState.socialPosts, myUserId) {
         uiState.socialPosts.filter { it.authorId.equals(myUserId, ignoreCase = true) }
     }
@@ -185,6 +186,7 @@ fun ActivityScreen(
                 items(uiState.activityNotifications, key = { it.id }) { item ->
                     ActivityRowCard(
                         item = item,
+                        avatarUrl = userMap[item.actorId.lowercase()]?.avatarUrl,
                         onClick = { onOpenActorProfile(item.actorId) }
                     )
                 }
@@ -213,6 +215,7 @@ private fun ReachStatColumn(label: String, value: String) {
 @Composable
 private fun ActivityRowCard(
     item: ActivityNotification,
+    avatarUrl: String?,
     onClick: () -> Unit
 ) {
     val (badgeIcon, badgeColor, actionDesc) = when (item.type) {
@@ -246,7 +249,8 @@ private fun ActivityRowCard(
                     isOnline = true,
                     seedKey = item.actorId,
                     size = 44.dp,
-                    showPresenceDot = false
+                    showPresenceDot = false,
+                    avatarUrl = avatarUrl
                 )
                 Surface(
                     shape = RoundedCornerShape(50),

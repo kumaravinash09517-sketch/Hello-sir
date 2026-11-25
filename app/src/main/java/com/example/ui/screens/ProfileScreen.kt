@@ -2,7 +2,13 @@ package com.example.ui.screens
 
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -10,13 +16,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -24,8 +30,10 @@ import androidx.compose.material.icons.automirrored.rounded.Chat
 import androidx.compose.material.icons.rounded.AddCircleOutline
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.Call
+import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.GridOn
+import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material.icons.rounded.Videocam
@@ -35,6 +43,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -61,11 +70,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.SocialMediaType
+import com.example.data.model.SocialPost
 import com.example.data.model.UserProfileExtras
 import com.example.ui.ChatUiState
-import com.example.ui.components.CommentsBottomSheet
 import com.example.ui.components.CreatePostBottomSheet
 import com.example.ui.components.PresenceBadge
+import com.example.ui.components.SocialPostViewerDialog
 import com.example.ui.components.UserAvatar
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -78,8 +88,14 @@ fun ProfileScreen(
     onStartCall: (userId: String, userName: String, isVideo: Boolean) -> Unit,
     onToggleFollow: (String) -> Unit,
     onUpdateBio: (String) -> Unit,
+    onUpdateAvatar: (Uri) -> Unit = {},
+    onToggleLike: (String) -> Unit = {},
+    onToggleBookmark: (String) -> Unit = {},
     onAddComment: (postId: String, text: String) -> Unit,
+    onRepost: (String) -> Unit = {},
+    onShareToChat: (SocialPost, String) -> Unit = { _, _ -> },
     onPublishPost: (SocialMediaType, Uri?, String, String) -> Unit,
+    onOpenUserProfile: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val currentSession = uiState.session ?: return
@@ -95,6 +111,7 @@ fun ProfileScreen(
     }
     val displayName = if (isMe) currentSession.name else matchedUser?.name ?: targetUserId
     val extras = uiState.profileExtras[targetUserId] ?: UserProfileExtras(userId = targetUserId)
+    val avatarUrl = matchedUser?.avatarUrl
 
     val userPosts = remember(uiState.socialPosts, targetUserId) {
         uiState.socialPosts.filter { it.authorId.equals(targetUserId, ignoreCase = true) }
@@ -112,19 +129,51 @@ fun ProfileScreen(
     var selectedPostId by remember { mutableStateOf<String?>(null) }
     var showCreateSheet by remember { mutableStateOf(false) }
 
+    val avatarPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            onUpdateAvatar(uri)
+        }
+    }
+
+    val displayedList = when (selectedTab) {
+        1 -> userReels
+        2 -> if (isMe) savedPosts else userPosts
+        else -> userPosts
+    }
+
     if (showEditBioDialog) {
         AlertDialog(
             onDismissRequest = { showEditBioDialog = false },
-            title = { Text("Edit Profile Bio") },
+            title = { Text("Edit Profile") },
             text = {
-                OutlinedTextField(
-                    value = bioDraft,
-                    onValueChange = { bioDraft = it },
-                    label = { Text("Bio") },
-                    minLines = 2,
-                    maxLines = 4,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            avatarPicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("change_profile_photo_button")
+                    ) {
+                        Icon(Icons.Rounded.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Change Profile Photo")
+                    }
+                    OutlinedTextField(
+                        value = bioDraft,
+                        onValueChange = { bioDraft = it },
+                        label = { Text("Bio") },
+                        minLines = 2,
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             },
             confirmButton = {
                 Button(
@@ -141,15 +190,28 @@ fun ProfileScreen(
     }
 
     if (selectedPostId != null) {
-        val post = uiState.socialPosts.firstOrNull { it.id == selectedPostId }
-        if (post != null) {
-            CommentsBottomSheet(
-                post = post,
-                comments = uiState.socialComments[post.id].orEmpty(),
-                onDismiss = { selectedPostId = null },
-                onAddComment = { text -> onAddComment(post.id, text) }
-            )
+        val viewerPosts = if (displayedList.any { it.id == selectedPostId }) {
+            displayedList
+        } else {
+            uiState.socialPosts
         }
+        SocialPostViewerDialog(
+            posts = viewerPosts,
+            initialPostId = selectedPostId!!,
+            currentUserId = currentSession.userId,
+            users = uiState.users,
+            commentsByPost = uiState.socialComments,
+            profileExtras = uiState.profileExtras,
+            onDismiss = { selectedPostId = null },
+            onOpenUserProfile = onOpenUserProfile,
+            onOpenChat = onOpenChat,
+            onToggleFollow = onToggleFollow,
+            onToggleLike = onToggleLike,
+            onToggleBookmark = onToggleBookmark,
+            onAddComment = onAddComment,
+            onRepost = onRepost,
+            onShareToChat = onShareToChat
+        )
     }
 
     if (showCreateSheet) {
@@ -211,217 +273,255 @@ fun ProfileScreen(
             )
         }
     ) { innerPadding ->
-        val displayedList = when (selectedTab) {
-            1 -> userReels
-            2 -> if (isMe) savedPosts else userPosts
-            else -> userPosts
-        }
         val gridRows = remember(displayedList) { displayedList.chunked(3) }
 
-        LazyColumn(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .testTag("profile_content"),
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            item(key = "profile_header") {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(18.dp)
-                    ) {
-                        val initials = displayName.trim().take(2).uppercase()
-                            .ifBlank { targetUserId.take(2).uppercase() }
-                        UserAvatar(
-                            initials = initials,
-                            isOnline = isMe || (matchedUser?.isOnline() == true),
-                            seedKey = targetUserId,
-                            size = 78.dp
-                        )
-                        Row(
-                            modifier = Modifier.weight(1f),
-                            horizontalArrangement = Arrangement.SpaceEvenly
-                        ) {
-                            ProfileStat("${userPosts.size}", "Posts")
-                            ProfileStat("${extras.followersCount}", "Followers")
-                            ProfileStat("${extras.followingCount}", "Following")
-                        }
-                    }
+            if (uiState.isPublishingPost || uiState.isUpdatingProfile || uiState.isRefreshing) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
 
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("profile_content"),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                item(key = "profile_header") {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Row(
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(18.dp)
                         ) {
-                            Text(
-                                text = displayName,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
-                            )
-                            PresenceBadge(
-                                isOnline = isMe || (matchedUser?.isOnline() == true),
-                                label = if (isMe || (matchedUser?.isOnline() == true)) "Online" else "Offline"
-                            )
-                        }
-                        Text(
-                            text = extras.bio,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-
-                    if (isMe) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            OutlinedButton(
-                                onClick = {
-                                    bioDraft = extras.bio
-                                    showEditBioDialog = true
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .heightIn(min = 46.dp)
-                                    .testTag("edit_profile_button")
+                            val initials = displayName.trim().take(2).uppercase()
+                                .ifBlank { targetUserId.take(2).uppercase() }
+                            Box(
+                                modifier = if (isMe) {
+                                    Modifier.clickable {
+                                        avatarPicker.launch(
+                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                        )
+                                    }
+                                } else {
+                                    Modifier
+                                }
                             ) {
-                                Icon(Icons.Rounded.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Edit Profile")
+                                UserAvatar(
+                                    initials = initials,
+                                    isOnline = isMe || (matchedUser?.isOnline() == true),
+                                    seedKey = targetUserId,
+                                    size = 78.dp,
+                                    showPresenceDot = !isMe,
+                                    avatarUrl = avatarUrl
+                                )
+                                if (isMe) {
+                                    Surface(
+                                        shape = CircleShape,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier
+                                            .align(Alignment.BottomEnd)
+                                            .size(26.dp)
+                                            .border(2.dp, MaterialTheme.colorScheme.background, CircleShape)
+                                            .testTag("profile_avatar_edit_badge")
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Icon(
+                                                imageVector = Icons.Rounded.CameraAlt,
+                                                contentDescription = "Update profile photo",
+                                                tint = MaterialTheme.colorScheme.onPrimary,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
+                                }
                             }
-                            FilledTonalButton(
-                                onClick = onOpenProfileSettings,
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .heightIn(min = 46.dp)
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                horizontalArrangement = Arrangement.SpaceEvenly
                             ) {
-                                Icon(Icons.Rounded.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Device & Lock")
-                            }
-                        }
-                    } else {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(
-                                onClick = { onToggleFollow(targetUserId) },
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier
-                                    .weight(1.2f)
-                                    .heightIn(min = 46.dp)
-                                    .testTag("profile_follow_button")
-                            ) {
-                                Text(if (extras.isFollowedByMe) "Following" else "Follow")
-                            }
-                            FilledTonalButton(
-                                onClick = { onOpenChat(targetUserId) },
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .heightIn(min = 46.dp)
-                                    .testTag("profile_chat_button")
-                            ) {
-                                Icon(Icons.AutoMirrored.Rounded.Chat, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Chat")
-                            }
-                            IconButton(
-                                onClick = { onStartCall(targetUserId, displayName, false) },
-                                modifier = Modifier
-                                    .minimumInteractiveComponentSize()
-                                    .testTag("profile_audio_call_button")
-                            ) {
-                                Icon(Icons.Rounded.Call, contentDescription = "Audio call", tint = MaterialTheme.colorScheme.primary)
-                            }
-                            IconButton(
-                                onClick = { onStartCall(targetUserId, displayName, true) },
-                                modifier = Modifier
-                                    .minimumInteractiveComponentSize()
-                                    .testTag("profile_video_call_button")
-                            ) {
-                                Icon(Icons.Rounded.Videocam, contentDescription = "Video call", tint = MaterialTheme.colorScheme.primary)
+                                ProfileStat("${userPosts.size}", "Posts")
+                                ProfileStat("${extras.followersCount}", "Followers")
+                                ProfileStat("${extras.followingCount}", "Following")
                             }
                         }
-                    }
-                }
-            }
 
-            item(key = "profile_tabs") {
-                val tabTitles = if (isMe) {
-                    listOf(
-                        "Posts" to Icons.Rounded.GridOn,
-                        "Reels" to Icons.Rounded.VideoLibrary,
-                        "Saved" to Icons.Rounded.Bookmark
-                    )
-                } else {
-                    listOf(
-                        "Posts" to Icons.Rounded.GridOn,
-                        "Reels" to Icons.Rounded.VideoLibrary
-                    )
-                }
-                PrimaryTabRow(selectedTabIndex = selectedTab.coerceAtMost(tabTitles.lastIndex)) {
-                    tabTitles.forEachIndexed { idx, (title, icon) ->
-                        Tab(
-                            selected = selectedTab == idx,
-                            onClick = { selectedTab = idx },
-                            text = { Text(title) },
-                            icon = { Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp)) }
-                        )
-                    }
-                }
-            }
-
-            if (gridRows.isEmpty()) {
-                item(key = "empty_profile_grid") {
-                    Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.surfaceContainerLow,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(28.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = displayName,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                PresenceBadge(
+                                    isOnline = isMe || (matchedUser?.isOnline() == true),
+                                    label = if (isMe || (matchedUser?.isOnline() == true)) "Online" else "Offline"
+                                )
+                            }
                             Text(
-                                text = when (selectedTab) {
-                                    1 -> "No Reels shared yet"
-                                    2 -> "No saved posts yet"
-                                    else -> "No posts yet"
-                                },
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "Tap the + button to share a photo, Reel, or Shayari.",
-                                style = MaterialTheme.typography.bodySmall,
+                                text = extras.bio,
+                                style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+
+                        if (isMe) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        bioDraft = extras.bio
+                                        showEditBioDialog = true
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("edit_profile_button")
+                                ) {
+                                    Icon(Icons.Rounded.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Edit Profile")
+                                }
+                                FilledTonalButton(
+                                    onClick = onOpenProfileSettings,
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                ) {
+                                    Icon(Icons.Rounded.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Device & Lock")
+                                }
+                            }
+                        } else {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = { onToggleFollow(targetUserId) },
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier
+                                        .weight(1.2f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("profile_follow_button")
+                                ) {
+                                    Text(if (extras.isFollowedByMe) "Following" else "Follow")
+                                }
+                                FilledTonalButton(
+                                    onClick = { onOpenChat(targetUserId) },
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("profile_chat_button")
+                                ) {
+                                    Icon(Icons.AutoMirrored.Rounded.Chat, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Chat")
+                                }
+                                IconButton(
+                                    onClick = { onStartCall(targetUserId, displayName, false) },
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("profile_audio_call_button")
+                                ) {
+                                    Icon(Icons.Rounded.Call, contentDescription = "Audio call", tint = MaterialTheme.colorScheme.primary)
+                                }
+                                IconButton(
+                                    onClick = { onStartCall(targetUserId, displayName, true) },
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("profile_video_call_button")
+                                ) {
+                                    Icon(Icons.Rounded.Videocam, contentDescription = "Video call", tint = MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                        }
                     }
                 }
-            } else {
-                items(gridRows, key = { row -> "p_" + row.joinToString("_") { it.id } }) { row ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        row.forEach { post ->
-                            ExplorePostTile(
-                                post = post,
-                                onClick = { selectedPostId = post.id },
-                                modifier = Modifier.weight(1f)
+
+                item(key = "profile_tabs") {
+                    val tabTitles = if (isMe) {
+                        listOf(
+                            "Posts" to Icons.Rounded.GridOn,
+                            "Reels" to Icons.Rounded.VideoLibrary,
+                            "Saved" to Icons.Rounded.Bookmark
+                        )
+                    } else {
+                        listOf(
+                            "Posts" to Icons.Rounded.GridOn,
+                            "Reels" to Icons.Rounded.VideoLibrary
+                        )
+                    }
+                    PrimaryTabRow(selectedTabIndex = selectedTab.coerceAtMost(tabTitles.lastIndex)) {
+                        tabTitles.forEachIndexed { idx, (title, icon) ->
+                            Tab(
+                                selected = selectedTab == idx,
+                                onClick = { selectedTab = idx },
+                                text = { Text(title) },
+                                icon = { Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp)) }
                             )
                         }
-                        repeat(3 - row.size) {
-                            Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+
+                if (gridRows.isEmpty()) {
+                    item(key = "empty_profile_grid") {
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(28.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = when (selectedTab) {
+                                        1 -> "No Reels shared yet"
+                                        2 -> "No saved posts yet"
+                                        else -> "No posts yet"
+                                    },
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "Tap the + button to share a photo, Reel, or Shayari.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    items(gridRows, key = { row -> "p_" + row.joinToString("_") { it.id } }) { row ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            row.forEach { post ->
+                                ExplorePostTile(
+                                    post = post,
+                                    onClick = { selectedPostId = post.id },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            repeat(3 - row.size) {
+                                Spacer(modifier = Modifier.weight(1f))
+                            }
                         }
                     }
                 }

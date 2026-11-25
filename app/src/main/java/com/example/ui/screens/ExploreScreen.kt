@@ -17,10 +17,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Chat
 import androidx.compose.material.icons.rounded.Call
@@ -36,6 +37,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -59,14 +61,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.example.data.model.SocialMediaType
 import com.example.data.model.SocialPost
 import com.example.ui.ChatUiState
-import com.example.ui.components.CommentsBottomSheet
 import com.example.ui.components.PresenceBadge
+import com.example.ui.components.SocialPostViewerDialog
 import com.example.ui.components.UserAvatar
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -79,6 +82,11 @@ fun ExploreScreen(
     onToggleFollow: (String) -> Unit,
     onStartCall: (userId: String, userName: String, isVideo: Boolean) -> Unit,
     onAddComment: (postId: String, text: String) -> Unit,
+    onToggleLike: (String) -> Unit = {},
+    onToggleBookmark: (String) -> Unit = {},
+    onRepost: (String) -> Unit = {},
+    onShareToChat: (SocialPost, String) -> Unit = { _, _ -> },
+    onSubmitSearch: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val currentUserId = uiState.session?.userId.orEmpty()
@@ -86,15 +94,28 @@ fun ExploreScreen(
     var selectedPostId by remember { mutableStateOf<String?>(null) }
 
     if (selectedPostId != null) {
-        val post = uiState.socialPosts.firstOrNull { it.id == selectedPostId }
-        if (post != null) {
-            CommentsBottomSheet(
-                post = post,
-                comments = uiState.socialComments[post.id].orEmpty(),
-                onDismiss = { selectedPostId = null },
-                onAddComment = { text -> onAddComment(post.id, text) }
-            )
+        val viewerPosts = if (uiState.exploredPosts.any { it.id == selectedPostId }) {
+            uiState.exploredPosts
+        } else {
+            uiState.socialPosts
         }
+        SocialPostViewerDialog(
+            posts = viewerPosts,
+            initialPostId = selectedPostId!!,
+            currentUserId = currentUserId,
+            users = uiState.users,
+            commentsByPost = uiState.socialComments,
+            profileExtras = uiState.profileExtras,
+            onDismiss = { selectedPostId = null },
+            onOpenUserProfile = onOpenUserProfile,
+            onOpenChat = onOpenChat,
+            onToggleFollow = onToggleFollow,
+            onToggleLike = onToggleLike,
+            onToggleBookmark = onToggleBookmark,
+            onAddComment = onAddComment,
+            onRepost = onRepost,
+            onShareToChat = onShareToChat
+        )
     }
 
     Scaffold(
@@ -121,18 +142,27 @@ fun ExploreScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
+            if (uiState.isSearchingRemote) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+
             OutlinedTextField(
                 value = uiState.exploreQuery,
                 onValueChange = onExploreQueryChange,
-                placeholder = { Text("Search people, @userId, or posts…") },
+                placeholder = { Text("Search people, @userId, phone, or posts…") },
                 leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
                 trailingIcon = {
                     if (uiState.exploreQuery.isNotEmpty()) {
-                        IconButton(onClick = { onExploreQueryChange("") }) {
+                        IconButton(
+                            onClick = { onExploreQueryChange("") },
+                            modifier = Modifier.minimumInteractiveComponentSize()
+                        ) {
                             Icon(Icons.Rounded.Close, contentDescription = "Clear search")
                         }
                     }
                 },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { onSubmitSearch() }),
                 singleLine = true,
                 shape = RoundedCornerShape(16.dp),
                 colors = OutlinedTextFieldDefaults.colors(
@@ -164,7 +194,11 @@ fun ExploreScreen(
                 if (uiState.exploredUsers.isEmpty()) {
                     item(key = "no_people") {
                         Text(
-                            text = "No matching users for \"${uiState.exploreQuery}\"",
+                            text = if (uiState.isSearchingRemote) {
+                                "Searching server for \"${uiState.exploreQuery}\"…"
+                            } else {
+                                "No matching users for \"${uiState.exploreQuery}\""
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -194,7 +228,8 @@ fun ExploreScreen(
                                     initials = user.initials,
                                     isOnline = user.isOnline(),
                                     seedKey = user.userId,
-                                    size = 46.dp
+                                    size = 46.dp,
+                                    avatarUrl = user.avatarUrl
                                 )
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
@@ -317,6 +352,7 @@ fun ExplorePostTile(
             .clip(RoundedCornerShape(10.dp))
             .background(MaterialTheme.colorScheme.surfaceContainerHigh)
             .clickable(onClick = onClick)
+            .testTag("explore_post_tile_${post.id}")
     ) {
         when (post.mediaType) {
             SocialMediaType.PHOTO -> {
@@ -339,25 +375,67 @@ fun ExplorePostTile(
             }
 
             SocialMediaType.REEL -> {
+                val thumbBytes = remember(post.inlineImageBase64) {
+                    if (post.inlineImageBase64.isNotBlank()) {
+                        runCatching { Base64.decode(post.inlineImageBase64, Base64.NO_WRAP) }.getOrNull()
+                    } else {
+                        null
+                    }
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color(0xFF102A27)),
+                        .background(
+                            Brush.linearGradient(
+                                listOf(Color(0xFF0F2E2A), Color(0xFF1F3A52))
+                            )
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
-                    if (post.mediaUri.isNotBlank()) {
+                    if (thumbBytes != null) {
                         AsyncImage(
-                            model = Uri.parse(post.mediaUri),
+                            model = thumbBytes,
                             contentDescription = "Reel thumbnail",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = 0.25f))
+                        )
+                    } else if (post.caption.isNotBlank()) {
+                        Text(
+                            text = post.caption,
+                            color = Color.White.copy(alpha = 0.72f),
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(8.dp)
+                        )
+                    }
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.6f),
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(5.dp)
+                    ) {
+                        Text(
+                            text = "REEL",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                        )
                     }
                     Icon(
                         imageVector = Icons.Rounded.PlayCircle,
-                        contentDescription = "Reel",
+                        contentDescription = "Play Reel",
                         tint = Color.White,
-                        modifier = Modifier.size(34.dp)
+                        modifier = Modifier.size(36.dp)
                     )
                 }
             }

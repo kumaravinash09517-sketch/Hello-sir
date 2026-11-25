@@ -344,6 +344,7 @@ class MainActivity : ComponentActivity() {
                                                 onRefresh = viewModel::refreshFeed,
                                                 onOpenActivity = viewModel::openActivityFeed,
                                                 onOpenUserProfile = viewModel::openUserProfile,
+                                                onOpenChat = { target -> viewModel.selectTarget(target) },
                                                 onToggleFollow = viewModel::toggleFollowUser,
                                                 onToggleLike = viewModel::toggleLikePost,
                                                 onToggleBookmark = viewModel::toggleBookmarkPost,
@@ -385,7 +386,12 @@ class MainActivity : ComponentActivity() {
                                                 onStartCall = { id, name, video ->
                                                     launchCallWithPermission(id, name, video)
                                                 },
-                                                onAddComment = viewModel::addComment
+                                                onAddComment = viewModel::addComment,
+                                                onToggleLike = viewModel::toggleLikePost,
+                                                onToggleBookmark = viewModel::toggleBookmarkPost,
+                                                onRepost = viewModel::repostPost,
+                                                onShareToChat = viewModel::sharePostToChat,
+                                                onSubmitSearch = viewModel::submitExploreSearch
                                             )
                                         }
 
@@ -432,8 +438,14 @@ class MainActivity : ComponentActivity() {
                                                 },
                                                 onToggleFollow = viewModel::toggleFollowUser,
                                                 onUpdateBio = viewModel::updateMyBio,
+                                                onUpdateAvatar = viewModel::updateMyAvatar,
+                                                onToggleLike = viewModel::toggleLikePost,
+                                                onToggleBookmark = viewModel::toggleBookmarkPost,
                                                 onAddComment = viewModel::addComment,
-                                                onPublishPost = viewModel::createSocialPost
+                                                onRepost = viewModel::repostPost,
+                                                onShareToChat = viewModel::sharePostToChat,
+                                                onPublishPost = viewModel::createSocialPost,
+                                                onOpenUserProfile = viewModel::openUserProfile
                                             )
                                         }
                                     }

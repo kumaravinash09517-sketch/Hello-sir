@@ -68,7 +68,9 @@ fun SocialVideoPlayer(
     isMuted: Boolean,
     onToggleMute: () -> Unit,
     modifier: Modifier = Modifier,
-    showBottomSeekBar: Boolean = true
+    showBottomSeekBar: Boolean = true,
+    fitInside: Boolean = false,
+    controlsTopPadding: androidx.compose.ui.unit.Dp = 12.dp
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -142,7 +144,11 @@ fun SocialVideoPlayer(
                 PlayerView(ctx).apply {
                     player = exoPlayer
                     useController = false
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                    resizeMode = if (fitInside) {
+                        AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    } else {
+                        AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                    }
                     layoutParams = ViewGroup.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
@@ -187,7 +193,7 @@ fun SocialVideoPlayer(
         Row(
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(12.dp),
+                .padding(top = controlsTopPadding, end = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             FilledIconButton(

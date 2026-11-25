@@ -76,6 +76,7 @@ fun ReelsScreen(
 ) {
     val currentUserId = uiState.session?.userId.orEmpty()
     val reels = uiState.reelsPosts
+    val userMap = remember(uiState.users) { uiState.users.associateBy { it.userId.lowercase() } }
 
     var isMuted by remember { mutableStateOf(false) }
     var activeCommentsPostId by remember { mutableStateOf<String?>(null) }
@@ -88,6 +89,7 @@ fun ReelsScreen(
             CommentsBottomSheet(
                 post = post,
                 comments = uiState.socialComments[post.id].orEmpty(),
+                users = uiState.users,
                 onDismiss = { activeCommentsPostId = null },
                 onAddComment = { text -> onAddComment(post.id, text) }
             )
@@ -168,6 +170,7 @@ fun ReelsScreen(
             ) { page ->
                 val reel = reels[page]
                 val isFollowed = uiState.profileExtras[reel.authorId]?.isFollowedByMe == true
+                val authorAvatar = userMap[reel.authorId.lowercase()]?.avatarUrl
 
                 Box(modifier = Modifier.fillMaxSize()) {
                     SocialVideoPlayer(
@@ -247,6 +250,7 @@ fun ReelsScreen(
                                 seedKey = reel.authorId,
                                 size = 38.dp,
                                 showPresenceDot = false,
+                                avatarUrl = authorAvatar,
                                 modifier = Modifier.clickable { onOpenUserProfile(reel.authorId) }
                             )
                             Column(

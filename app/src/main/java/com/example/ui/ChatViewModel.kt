@@ -63,6 +63,9 @@ data class ChatUiState(
     val isSending: Boolean = false,
     val isFetchingLocation: Boolean = false,
     val isLiveLocationSharing: Boolean = false,
+    val isSearchingRemote: Boolean = false,
+    val isPublishingPost: Boolean = false,
+    val isUpdatingProfile: Boolean = false,
     val registerError: String? = null,
     val sendError: String? = null,
     val syncError: String? = null,
@@ -84,7 +87,8 @@ data class ChatUiState(
             } else {
                 users.filter {
                     it.name.contains(q, ignoreCase = true) ||
-                        it.userId.contains(q, ignoreCase = true)
+                        it.userId.contains(q, ignoreCase = true) ||
+                        (it.phone?.contains(q, ignoreCase = true) == true)
                 }
             }
             return filtered.sortedWith(
@@ -95,7 +99,7 @@ data class ChatUiState(
         }
 
     /**
-     * Supports Explore search by Name, Username, or @UserID (case-insensitive, @-prefix supported).
+     * Supports Explore search by Name, Username, @UserID, or Phone (case-insensitive, @-prefix supported).
      */
     val exploredUsers: List<ChatUser>
         get() {
@@ -103,7 +107,8 @@ data class ChatUiState(
             if (q.isEmpty()) return users
             return users.filter {
                 it.name.contains(q, ignoreCase = true) ||
-                    it.userId.contains(q, ignoreCase = true)
+                    it.userId.contains(q, ignoreCase = true) ||
+                    (it.phone?.contains(q, ignoreCase = true) == true)
             }
         }
 
@@ -175,6 +180,9 @@ private data class LocalUiFlags(
     val isRefreshing: Boolean = false,
     val isSending: Boolean = false,
     val isFetchingLocation: Boolean = false,
+    val isSearchingRemote: Boolean = false,
+    val isPublishingPost: Boolean = false,
+    val isUpdatingProfile: Boolean = false,
     val registerError: String? = null,
     val sendError: String? = null,
     val blockedAlertMessage: String? = null
@@ -245,6 +253,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             isSending = flags.isSending,
             isFetchingLocation = flags.isFetchingLocation,
             isLiveLocationSharing = isLiveLoc,
+            isSearchingRemote = flags.isSearchingRemote,
+            isPublishingPost = flags.isPublishingPost,
+            isUpdatingProfile = flags.isUpdatingProfile,
             registerError = flags.registerError,
             sendError = flags.sendError,
             syncError = syncError,
@@ -294,6 +305,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 showActivityFeed = false,
                 showProfileSettings = false
             )
+        }
+        viewModelScope.launch {
+            repository.fetchAndCacheUser(userId)
+            repository.refreshFeed()
         }
     }
 
@@ -464,11 +479,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             _toastEvents.tryEmit("Add a photo, video, or caption to publish.")
             return
         }
-        viewModelScope.launch {
-            repository.createSocialPost(mediaType, mediaUri, caption, shayariTag)
+        if ((mediaType == SocialMediaType.REEL || mediaType == SocialMediaType.PHOTO) && mediaUri == null) {
             _toastEvents.tryEmit(
-                if (mediaType == SocialMediaType.REEL) "Reel published!" else "Post shared to feed!"
+                if (mediaType == SocialMediaType.REEL) "Select a video to publish a Reel."
+                else "Select a photo or switch to Quote/Shayari."
             )
+            return
+        }
+        viewModelScope.launch {
+            localFlags.update { it.copy(isPublishingPost = true) }
+            val result = repository.createSocialPost(mediaType, mediaUri, caption, shayariTag)
+            localFlags.update { it.copy(isPublishingPost = false) }
+            when (result) {
+                is NetworkResult.Success -> {
+                    _toastEvents.tryEmit(
+                        if (mediaType == SocialMediaType.REEL) "Reel published!" else "Post shared to feed!"
+                    )
+                }
+                is NetworkResult.Blocked -> {
+                    localFlags.update { it.copy(blockedAlertMessage = result.message) }
+                    _toastEvents.tryEmit(result.message)
+                }
+                is NetworkResult.Error -> {
+                    _toastEvents.tryEmit(result.message)
+                }
+            }
         }
     }
 
@@ -506,9 +541,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateMyBio(bio: String) {
+        updateMyProfile(bio = bio, avatarUri = null)
+    }
+
+    fun updateMyAvatar(avatarUri: Uri) {
+        updateMyProfile(bio = null, avatarUri = avatarUri)
+    }
+
+    fun updateMyProfile(bio: String?, avatarUri: Uri?) {
         viewModelScope.launch {
-            repository.updateMyBio(bio)
-            _toastEvents.tryEmit("Profile updated.")
+            localFlags.update { it.copy(isUpdatingProfile = true) }
+            val result = repository.updateMyProfile(bio, avatarUri)
+            localFlags.update { it.copy(isUpdatingProfile = false) }
+            when (result) {
+                is NetworkResult.Success -> _toastEvents.tryEmit("Profile updated & synced!")
+                is NetworkResult.Blocked -> _toastEvents.tryEmit(result.message)
+                is NetworkResult.Error -> _toastEvents.tryEmit(result.message)
+            }
         }
     }
 
@@ -569,13 +618,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         triggerRemoteUserSearch(query)
     }
 
-    private fun triggerRemoteUserSearch(query: String) {
-        val clean = query.trim().removePrefix("@")
-        if (clean.length < 2) return
+    fun submitExploreSearch() {
+        val clean = localFlags.value.exploreQuery.trim().removePrefix("@")
+        if (clean.isEmpty()) return
         remoteSearchJob?.cancel()
         remoteSearchJob = viewModelScope.launch {
-            delay(350L)
+            localFlags.update { it.copy(isSearchingRemote = true) }
             repository.searchRemoteUsers(clean)
+            localFlags.update { it.copy(isSearchingRemote = false) }
+        }
+    }
+
+    private fun triggerRemoteUserSearch(query: String) {
+        val clean = query.trim().removePrefix("@")
+        if (clean.isEmpty()) {
+            remoteSearchJob?.cancel()
+            localFlags.update { it.copy(isSearchingRemote = false) }
+            return
+        }
+        remoteSearchJob?.cancel()
+        remoteSearchJob = viewModelScope.launch {
+            delay(280L)
+            localFlags.update { it.copy(isSearchingRemote = true) }
+            repository.searchRemoteUsers(clean)
+            localFlags.update { it.copy(isSearchingRemote = false) }
         }
     }
 
