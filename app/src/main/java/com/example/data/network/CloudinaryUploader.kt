@@ -4,11 +4,14 @@ import android.content.Context
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.Locale
@@ -17,6 +20,32 @@ data class UploadedMediaResult(
     val remoteUrl: String,
     val source: String
 )
+
+private class ProgressBytesRequestBody(
+    private val bytes: ByteArray,
+    private val mediaType: MediaType?,
+    private val onProgress: (Int) -> Unit
+) : RequestBody() {
+    override fun contentType(): MediaType? = mediaType
+    override fun contentLength(): Long = bytes.size.toLong()
+
+    override fun writeTo(sink: BufferedSink) {
+        val total = bytes.size.coerceAtLeast(1)
+        var offset = 0
+        val chunkSize = 16 * 1024
+        var lastPct = -1
+        while (offset < bytes.size) {
+            val count = minOf(chunkSize, bytes.size - offset)
+            sink.write(bytes, offset, count)
+            offset += count
+            val pct = ((offset * 98L) / total).toInt().coerceIn(0, 98)
+            if (pct != lastPct) {
+                lastPct = pct
+                onProgress(pct)
+            }
+        }
+    }
+}
 
 /**
  * Handles media uploads for images, videos, reels, stories, avatars, and chat attachments.
@@ -34,18 +63,22 @@ class MediaUploadService(
         fileName: String,
         mimeType: String,
         userId: String,
-        mediaTypeTag: String = "media"
+        mediaTypeTag: String = "media",
+        onProgress: (Int) -> Unit = {}
     ): UploadedMediaResult? = withContext(Dispatchers.IO) {
+        onProgress(2)
         val bytes = runCatching {
             context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
         }.getOrNull() ?: return@withContext null
 
+        onProgress(6)
         uploadBytes(
             bytes = bytes,
             fileName = fileName,
             mimeType = mimeType,
             userId = userId,
-            mediaTypeTag = mediaTypeTag
+            mediaTypeTag = mediaTypeTag,
+            onProgress = onProgress
         )
     }
 
@@ -54,19 +87,22 @@ class MediaUploadService(
         fileName: String,
         mimeType: String,
         userId: String,
-        mediaTypeTag: String = "media"
+        mediaTypeTag: String = "media",
+        onProgress: (Int) -> Unit = {}
     ): UploadedMediaResult? = withContext(Dispatchers.IO) {
         if (bytes.isEmpty()) return@withContext null
 
         // 1. Try signed Cloudinary upload first if credentials are present via BuildConfig
         if (BackendConfig.isCloudinarySigningConfigured()) {
-            uploadToCloudinary(bytes, fileName, mimeType)?.let { cloudUrl ->
+            uploadToCloudinary(bytes, fileName, mimeType, onProgress)?.let { cloudUrl ->
+                onProgress(100)
                 return@withContext UploadedMediaResult(cloudUrl, "cloudinary")
             }
         }
 
         // 2. Upload to live Render /api/media/upload and resolve https://rendar2-o9gq.onrender.com/uploads/...
-        uploadToRender(bytes, fileName, mimeType, userId, mediaTypeTag)?.let { renderUrl ->
+        uploadToRender(bytes, fileName, mimeType, userId, mediaTypeTag, onProgress)?.let { renderUrl ->
+            onProgress(100)
             return@withContext UploadedMediaResult(renderUrl, "render")
         }
 
@@ -76,7 +112,8 @@ class MediaUploadService(
     private fun uploadToCloudinary(
         bytes: ByteArray,
         fileName: String,
-        mimeType: String
+        mimeType: String,
+        onProgress: (Int) -> Unit
     ): String? {
         val apiKey = BackendConfig.cloudinaryApiKey
         val apiSecret = BackendConfig.cloudinaryApiSecret
@@ -89,13 +126,15 @@ class MediaUploadService(
             apiSecret = apiSecret
         )
 
+        val fileBody = ProgressBytesRequestBody(
+            bytes = bytes,
+            mediaType = mimeType.ifBlank { "application/octet-stream" }.toMediaTypeOrNull(),
+            onProgress = onProgress
+        )
+
         val requestBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart(
-                "file",
-                fileName.ifBlank { "upload.bin" },
-                bytes.toRequestBody(mimeType.ifBlank { "application/octet-stream" }.toMediaTypeOrNull())
-            )
+            .addFormDataPart("file", fileName.ifBlank { "upload.bin" }, fileBody)
             .addFormDataPart("api_key", apiKey)
             .addFormDataPart("timestamp", timestampSec)
             .addFormDataPart("folder", folder)
@@ -124,14 +163,16 @@ class MediaUploadService(
         fileName: String,
         mimeType: String,
         userId: String,
-        mediaTypeTag: String
+        mediaTypeTag: String,
+        onProgress: (Int) -> Unit
     ): String? {
         val safeName = fileName.ifBlank { "file_${System.currentTimeMillis()}" }
-        val filePart = MultipartBody.Part.createFormData(
-            "file",
-            safeName,
-            bytes.toRequestBody(mimeType.ifBlank { "application/octet-stream" }.toMediaTypeOrNull())
+        val fileBody = ProgressBytesRequestBody(
+            bytes = bytes,
+            mediaType = mimeType.ifBlank { "application/octet-stream" }.toMediaTypeOrNull(),
+            onProgress = onProgress
         )
+        val filePart = MultipartBody.Part.createFormData("file", safeName, fileBody)
         val userPart = userId.toRequestBody("text/plain".toMediaTypeOrNull())
         val typePart = mediaTypeTag.toRequestBody("text/plain".toMediaTypeOrNull())
 

@@ -67,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.example.data.model.SocialMediaType
 import com.example.data.model.SocialPost
+import com.example.data.network.BackendConfig
 import com.example.ui.ChatUiState
 import com.example.ui.components.PresenceBadge
 import com.example.ui.components.SocialPostViewerDialog
@@ -87,6 +88,7 @@ fun ExploreScreen(
     onRepost: (String) -> Unit = {},
     onShareToChat: (SocialPost, String) -> Unit = { _, _ -> },
     onSubmitSearch: () -> Unit = {},
+    onDownloadVideo: (SocialPost) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val currentUserId = uiState.session?.userId.orEmpty()
@@ -114,7 +116,8 @@ fun ExploreScreen(
             onToggleBookmark = onToggleBookmark,
             onAddComment = onAddComment,
             onRepost = onRepost,
-            onShareToChat = onShareToChat
+            onShareToChat = onShareToChat,
+            onDownloadVideo = onDownloadVideo
         )
     }
 
@@ -375,11 +378,11 @@ fun ExplorePostTile(
             }
 
             SocialMediaType.REEL -> {
-                val thumbBytes = remember(post.inlineImageBase64) {
+                val thumbModel: Any? = remember(post.inlineImageBase64, post.mediaUri) {
                     if (post.inlineImageBase64.isNotBlank()) {
                         runCatching { Base64.decode(post.inlineImageBase64, Base64.NO_WRAP) }.getOrNull()
                     } else {
-                        null
+                        BackendConfig.deriveVideoThumbnailUrl(post.mediaUri).takeIf { it.isNotBlank() }
                     }
                 }
                 Box(
@@ -392,9 +395,9 @@ fun ExplorePostTile(
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    if (thumbBytes != null) {
+                    if (thumbModel != null) {
                         AsyncImage(
-                            model = thumbBytes,
+                            model = thumbModel,
                             contentDescription = "Reel thumbnail",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()

@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Logout
+import androidx.compose.material.icons.rounded.Block
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.NotificationsOff
@@ -56,6 +57,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.data.model.BlockedUser
 import com.example.data.model.UserSession
 import com.example.ui.components.UserAvatar
 import com.example.webrtc.SignalingTransportState
@@ -69,6 +71,8 @@ fun ProfileSettingsScreen(
     session: UserSession,
     transportState: SignalingTransportState,
     notificationsEnabled: Boolean,
+    blockedUsers: List<BlockedUser> = emptyList(),
+    onUnblockUser: (String) -> Unit = {},
     onRequestNotifications: () -> Unit,
     onBack: () -> Unit,
     onLogoutAndReset: () -> Unit,
@@ -76,6 +80,44 @@ fun ProfileSettingsScreen(
 ) {
     BackHandler(onBack = onBack)
     var showConfirmLogout by remember { mutableStateOf(false) }
+    var showBlockedDialog by remember { mutableStateOf(false) }
+
+    if (showBlockedDialog) {
+        AlertDialog(
+            onDismissRequest = { showBlockedDialog = false },
+            title = { Text("Blocked Users (${blockedUsers.size})") },
+            text = {
+                if (blockedUsers.isEmpty()) {
+                    Text("No blocked users on this device.")
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        blockedUsers.forEach { blocked ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(blocked.name, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        "@${blocked.userId}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                TextButton(onClick = { onUnblockUser(blocked.userId) }) {
+                                    Text("Unblock")
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showBlockedDialog = false }) { Text("Done") }
+            }
+        )
+    }
 
     if (showConfirmLogout) {
         AlertDialog(
@@ -270,6 +312,19 @@ fun ProfileSettingsScreen(
                         "Enable Push Notifications"
                     }
                 )
+            }
+
+            OutlinedButton(
+                onClick = { showBlockedDialog = true },
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp)
+                    .testTag("manage_blocked_users_button")
+            ) {
+                Icon(imageVector = Icons.Rounded.Block, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Blocked Users (${blockedUsers.size})")
             }
 
             Spacer(modifier = Modifier.height(12.dp))

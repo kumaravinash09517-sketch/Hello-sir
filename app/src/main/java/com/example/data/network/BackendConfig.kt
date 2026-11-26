@@ -61,6 +61,25 @@ object BackendConfig {
         }
     }
 
+    fun deriveVideoThumbnailUrl(videoUrl: String?): String {
+        val raw = videoUrl?.trim().orEmpty()
+        if (raw.isEmpty()) return ""
+        val lower = raw.lowercase()
+        if (lower.contains("res.cloudinary.com/") && lower.contains("/video/upload/")) {
+            val withPoster = raw.replaceFirst("/video/upload/", "/video/upload/so_0,w_480,c_limit/")
+            val queryIdx = withPoster.indexOf('?')
+            val basePart = if (queryIdx >= 0) withPoster.substring(0, queryIdx) else withPoster
+            val dotIdx = basePart.lastIndexOf('.')
+            val slashIdx = basePart.lastIndexOf('/')
+            return if (dotIdx > slashIdx) {
+                "${basePart.substring(0, dotIdx)}.jpg"
+            } else {
+                "$basePart.jpg"
+            }
+        }
+        return ""
+    }
+
     private fun sanitizeConfigValue(raw: String?): String {
         val trimmed = raw?.trim().orEmpty()
         if (trimmed.isEmpty()) return ""

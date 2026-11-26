@@ -47,10 +47,12 @@ import androidx.compose.material.icons.rounded.Campaign
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.DoneAll
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Forum
 import androidx.compose.material.icons.rounded.LocationOn
 import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material.icons.rounded.PhotoLibrary
+import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.SwapHoriz
 import androidx.compose.material.icons.rounded.Videocam
@@ -87,6 +89,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
@@ -98,6 +101,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import com.example.R
@@ -106,8 +111,10 @@ import com.example.data.model.ChatMessage
 import com.example.data.model.ChatUser
 import com.example.data.model.MessageDeliveryStatus
 import com.example.data.model.MessageKind
+import com.example.data.network.BackendConfig
 import com.example.media.MediaHelper
 import com.example.ui.components.PresenceBadge
+import com.example.ui.components.SocialVideoPlayer
 import com.example.ui.components.UserAvatar
 import com.example.ui.theme.OnlineGreen
 import java.util.Locale
@@ -131,6 +138,7 @@ fun ChatScreen(
     onSendMedia: (receiver: String, uri: Uri, kind: MessageKind?) -> Unit,
     onStartCall: (targetUserId: String, targetUserName: String, isVideo: Boolean) -> Unit,
     onDeleteMessage: (ChatMessage) -> Unit = {},
+    onDownloadVideo: (url: String, title: String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
     if (showBackButton) {
@@ -151,6 +159,8 @@ fun ChatScreen(
     var pendingLiveLocation by remember { mutableStateOf(false) }
     var pendingVideoCall by remember { mutableStateOf<Boolean?>(null) }
     var pendingDeleteMessage by remember { mutableStateOf<ChatMessage?>(null) }
+    var activeVideoPreview by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var videoPlayerMuted by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
 
@@ -278,6 +288,84 @@ fun ChatScreen(
                 }
             }
         )
+    }
+
+    activeVideoPreview?.let { (videoUrl, videoTitle) ->
+        Dialog(
+            onDismissRequest = { activeVideoPreview = null },
+            properties = DialogProperties(
+                usePlatformDefaultWidth = false,
+                decorFitsSystemWindows = false
+            )
+        ) {
+            BackHandler(onBack = { activeVideoPreview = null })
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+                    .testTag("chat_video_player_dialog")
+            ) {
+                SocialVideoPlayer(
+                    videoUri = videoUrl,
+                    isVisible = true,
+                    isMuted = videoPlayerMuted,
+                    onToggleMute = { videoPlayerMuted = !videoPlayerMuted },
+                    showBottomSeekBar = true,
+                    fitInside = true,
+                    controlsTopPadding = 68.dp,
+                    modifier = Modifier.fillMaxSize()
+                )
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 32.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        FilledIconButton(
+                            onClick = { activeVideoPreview = null },
+                            colors = IconButtonDefaults.filledIconButtonColors(
+                                containerColor = Color.Black.copy(alpha = 0.55f),
+                                contentColor = Color.White
+                            ),
+                            modifier = Modifier.size(44.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Close video"
+                            )
+                        }
+                        Text(
+                            text = videoTitle,
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    FilledIconButton(
+                        onClick = { onDownloadVideo(videoUrl, videoTitle) },
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = Color.Black.copy(alpha = 0.55f),
+                            contentColor = Color.White
+                        ),
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Download,
+                            contentDescription = "Download video"
+                        )
+                    }
+                }
+            }
+        }
     }
 
     if (showAttachmentSheet) {
@@ -767,7 +855,9 @@ fun ChatScreen(
                         senderDisplayName = senderDisplay,
                         isMine = isMine,
                         showSenderName = isBroadcast || !isMine,
-                        onLongClick = { if (isMine) pendingDeleteMessage = msg }
+                        onLongClick = { if (isMine) pendingDeleteMessage = msg },
+                        onOpenVideo = { url, title -> activeVideoPreview = url to title },
+                        onDownloadVideo = onDownloadVideo
                     )
                 }
             }
@@ -815,7 +905,9 @@ private fun MessageBubble(
     senderDisplayName: String,
     isMine: Boolean,
     showSenderName: Boolean,
-    onLongClick: () -> Unit = {}
+    onLongClick: () -> Unit = {},
+    onOpenVideo: (url: String, title: String) -> Unit = { _, _ -> },
+    onDownloadVideo: (url: String, title: String) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
     val bubbleShape = if (isMine) {
@@ -965,12 +1057,130 @@ private fun MessageBubble(
                         }
                     }
 
-                    MessageKind.VIDEO,
+                    MessageKind.VIDEO -> {
+                        val media = message.media
+                        val videoUrl = media?.localUri.orEmpty()
+                        val videoTitle = media?.displayName?.ifBlank { null } ?: message.text.ifBlank { "Reel Video" }
+                        val thumbModel: Any? = remember(media?.inlineDataBase64, videoUrl) {
+                            when {
+                                !media?.inlineDataBase64.isNullOrBlank() ->
+                                    runCatching { Base64.decode(media!!.inlineDataBase64, Base64.NO_WRAP) }.getOrNull()
+                                videoUrl.isNotBlank() ->
+                                    BackendConfig.deriveVideoThumbnailUrl(videoUrl).takeIf { it.isNotBlank() }
+                                else -> null
+                            }
+                        }
+
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(190.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(
+                                        Brush.linearGradient(
+                                            listOf(Color(0xFF0F2E2A), Color(0xFF1F3A52))
+                                        )
+                                    )
+                                    .clickable {
+                                        if (videoUrl.isNotBlank()) {
+                                            onOpenVideo(videoUrl, videoTitle)
+                                        }
+                                    }
+                                    .testTag("chat_video_card_${message.id}"),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (thumbModel != null) {
+                                    AsyncImage(
+                                        model = thumbModel,
+                                        contentDescription = videoTitle,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color.Black.copy(alpha = 0.28f))
+                                    )
+                                }
+
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.65f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .padding(8.dp)
+                                ) {
+                                    Text(
+                                        text = "REEL",
+                                        color = Color.White,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                    )
+                                }
+
+                                if (videoUrl.isNotBlank()) {
+                                    FilledIconButton(
+                                        onClick = { onDownloadVideo(videoUrl, videoTitle) },
+                                        colors = IconButtonDefaults.filledIconButtonColors(
+                                            containerColor = Color.Black.copy(alpha = 0.58f),
+                                            contentColor = Color.White
+                                        ),
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(6.dp)
+                                            .size(34.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Download,
+                                            contentDescription = "Download video",
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+
+                                Icon(
+                                    imageVector = Icons.Rounded.PlayCircle,
+                                    contentDescription = "Play video",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(54.dp)
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = videoTitle,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = textColor,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                media?.formattedSize()?.takeIf { it.isNotEmpty() }?.let { sz ->
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = sz,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = metaColor
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     MessageKind.AUDIO,
                     MessageKind.DOCUMENT -> {
                         val media = message.media
                         val docIcon = when (message.kind) {
-                            MessageKind.VIDEO -> Icons.Rounded.VideoLibrary
                             MessageKind.AUDIO -> Icons.Rounded.AudioFile
                             else -> Icons.Rounded.Description
                         }

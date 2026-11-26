@@ -37,11 +37,13 @@ import androidx.compose.material.icons.automirrored.rounded.Chat
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.BookmarkBorder
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.FormatQuote
 import androidx.compose.material.icons.rounded.Fullscreen
 import androidx.compose.material.icons.rounded.PhotoLibrary
+import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.VideoLibrary
@@ -104,7 +106,8 @@ fun SocialPostCard(
     onToggleBookmark: (String) -> Unit,
     modifier: Modifier = Modifier,
     authorAvatarUrl: String? = null,
-    onOpenFullScreen: (SocialPost) -> Unit = {}
+    onOpenFullScreen: (SocialPost) -> Unit = {},
+    onDownloadVideo: (SocialPost) -> Unit = {}
 ) {
     var showDoubleTapHeart by remember { mutableStateOf(false) }
 
@@ -398,6 +401,20 @@ fun SocialPostCard(
                 )
 
                 Spacer(modifier = Modifier.weight(1f))
+
+                if (post.mediaType == SocialMediaType.REEL && post.mediaUri.isNotBlank()) {
+                    IconButton(
+                        onClick = { onDownloadVideo(post) },
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("download_button_${post.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Download,
+                            contentDescription = "Download Reel"
+                        )
+                    }
+                }
 
                 IconButton(
                     onClick = { onToggleBookmark(post.id) },
@@ -758,6 +775,55 @@ fun CreatePostBottomSheet(
             }
 
             if (selectedType != SocialMediaType.QUOTE) {
+                if (pickedUri != null) {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        if (selectedType == SocialMediaType.PHOTO) {
+                            AsyncImage(
+                                model = pickedUri,
+                                contentDescription = "Selected photo preview",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(170.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                            )
+                        } else {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.PlayCircle,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(36.dp)
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Reel video selected",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = pickedUri?.lastPathSegment ?: "Ready to upload",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 OutlinedButton(
                     onClick = {
                         if (selectedType == SocialMediaType.REEL) {
@@ -799,7 +865,15 @@ fun CreatePostBottomSheet(
             OutlinedTextField(
                 value = caption,
                 onValueChange = { caption = it },
-                label = { Text(if (selectedType == SocialMediaType.QUOTE) "Write your Shayari or thought" else "Write a caption…") },
+                label = {
+                    Text(
+                        when (selectedType) {
+                            SocialMediaType.QUOTE -> "Write your Shayari or thought"
+                            SocialMediaType.REEL -> "Reel Title / Caption"
+                            SocialMediaType.PHOTO -> "Photo Title / Caption"
+                        }
+                    )
+                },
                 minLines = 2,
                 maxLines = 5,
                 shape = RoundedCornerShape(16.dp),

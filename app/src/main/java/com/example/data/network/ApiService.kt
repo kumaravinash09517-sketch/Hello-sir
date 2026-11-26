@@ -82,6 +82,26 @@ interface ApiService {
         @Part("mediaType") mediaType: RequestBody? = null
     ): Response<ResponseBody>
 
+    // ==================== Social Posts & Moderation ====================
+
+    @GET("api/posts")
+    suspend fun getPosts(@Query("userId") userId: String? = null): Response<ResponseBody>
+
+    @POST("api/posts")
+    suspend fun createPost(@Body body: RequestBody): Response<ResponseBody>
+
+    @GET("api/posts/{userId}")
+    suspend fun getUserPosts(@Path("userId") userId: String): Response<ResponseBody>
+
+    @POST("api/users/follow")
+    suspend fun followAction(@Body body: RequestBody): Response<ResponseBody>
+
+    @POST("api/users/block")
+    suspend fun blockUser(@Body body: RequestBody): Response<ResponseBody>
+
+    @POST("api/users/unblock")
+    suspend fun unblockUser(@Body body: RequestBody): Response<ResponseBody>
+
     // ==================== WebRTC Calling & Signaling ====================
 
     @GET("api/webrtc/ice-servers")

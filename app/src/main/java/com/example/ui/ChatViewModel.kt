@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.ChatRepository
 import com.example.data.model.ActivityNotification
 import com.example.data.model.BROADCAST_TARGET_ID
+import com.example.data.model.BlockedUser
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatUser
 import com.example.data.model.MessageKind
@@ -14,8 +15,11 @@ import com.example.data.model.NetworkResult
 import com.example.data.model.SocialComment
 import com.example.data.model.SocialMediaType
 import com.example.data.model.SocialPost
+import com.example.data.model.SocialRelation
+import com.example.data.model.UploadProgressState
 import com.example.data.model.UserProfileExtras
 import com.example.data.model.UserSession
+import com.example.media.MediaHelper
 import com.example.webrtc.CallStatus
 import com.example.webrtc.CallUiState
 import com.example.webrtc.SignalingTransportState
@@ -66,6 +70,9 @@ data class ChatUiState(
     val isSearchingRemote: Boolean = false,
     val isPublishingPost: Boolean = false,
     val isUpdatingProfile: Boolean = false,
+    val uploadProgress: UploadProgressState? = null,
+    val socialRelations: List<SocialRelation> = emptyList(),
+    val blockedUsers: List<BlockedUser> = emptyList(),
     val registerError: String? = null,
     val sendError: String? = null,
     val syncError: String? = null,
@@ -74,18 +81,48 @@ data class ChatUiState(
     val callState: CallUiState = CallUiState(),
     val signalingTransportState: SignalingTransportState = SignalingTransportState.DISCONNECTED
 ) {
+    val blockedUserIds: Set<String>
+        get() = blockedUsers.map { it.userId.lowercase() }.toSet()
+
+    fun isUserBlocked(userId: String): Boolean =
+        userId.isNotBlank() && blockedUserIds.contains(userId.lowercase())
+
+    fun followersOf(userId: String): List<ChatUser> {
+        val followerIds = socialRelations
+            .filter { it.followingId.equals(userId, ignoreCase = true) }
+            .map { it.followerId }
+            .distinctBy { it.lowercase() }
+        val userMap = users.associateBy { it.userId.lowercase() }
+        return followerIds.map { fid ->
+            userMap[fid.lowercase()] ?: ChatUser(userId = fid, name = fid)
+        }
+    }
+
+    fun followingOf(userId: String): List<ChatUser> {
+        val followingIds = socialRelations
+            .filter { it.followerId.equals(userId, ignoreCase = true) }
+            .map { it.followingId }
+            .distinctBy { it.lowercase() }
+        val userMap = users.associateBy { it.userId.lowercase() }
+        return followingIds.map { fid ->
+            userMap[fid.lowercase()] ?: ChatUser(userId = fid, name = fid)
+        }
+    }
+
     /**
      * Sorts chat users so active conversations with the newest messages bubble to the top,
-     * preserving online priority and alphabetical fallback.
+     * preserving online priority and alphabetical fallback. Excludes locally blocked users.
      */
     val sortedChatUsers: List<ChatUser>
         get() {
             val now = System.currentTimeMillis()
+            val blocked = blockedUserIds
+            val unblocked = users.filterNot { blocked.contains(it.userId.lowercase()) }
             val q = searchQuery.trim().removePrefix("@")
             val filtered = if (q.isEmpty()) {
-                users
+                unblocked
             } else {
-                users.filter {
+                unblocked.filter {
                     it.name.contains(q, ignoreCase = true) ||
                         it.userId.contains(q, ignoreCase = true) ||
                         (it.phone?.contains(q, ignoreCase = true) == true)
@@ -103,9 +140,11 @@ data class ChatUiState(
      */
     val exploredUsers: List<ChatUser>
         get() {
+            val blocked = blockedUserIds
+            val unblocked = users.filterNot { blocked.contains(it.userId.lowercase()) }
             val q = exploreQuery.trim().removePrefix("@")
-            if (q.isEmpty()) return users
-            return users.filter {
+            if (q.isEmpty()) return unblocked
+            return unblocked.filter {
                 it.name.contains(q, ignoreCase = true) ||
                     it.userId.contains(q, ignoreCase = true) ||
                     (it.phone?.contains(q, ignoreCase = true) == true)
@@ -129,8 +168,11 @@ data class ChatUiState(
 
     val totalUnreadMessages: Int
         get() {
+            val blocked = blockedUserIds
             val broadcastUnread = unreadCountForTarget(BROADCAST_TARGET_ID)
-            val userUnread = users.sumOf { unreadCountForTarget(it.userId) }
+            val userUnread = users
+                .filterNot { blocked.contains(it.userId.lowercase()) }
+                .sumOf { unreadCountForTarget(it.userId) }
             return broadcastUnread + userUnread
         }
 
@@ -138,7 +180,10 @@ data class ChatUiState(
         get() = activityNotifications.count { !it.isRead }
 
     val onlineCount: Int
-        get() = users.count { it.isOnline() }
+        get() {
+            val blocked = blockedUserIds
+            return users.count { !blocked.contains(it.userId.lowercase()) && it.isOnline() }
+        }
 
     fun unreadCountForTarget(targetId: String): Int {
         val me = session?.userId ?: return 0
@@ -151,8 +196,9 @@ data class ChatUiState(
 
     fun messagesForTarget(targetId: String): List<ChatMessage> {
         val me = session?.userId ?: return emptyList()
+        val blocked = blockedUserIds
         if (targetId == BROADCAST_TARGET_ID) {
-            return messages.filter { it.isBroadcast }
+            return messages.filter { it.isBroadcast && !blocked.contains(it.sender.lowercase()) }
         }
         return messages.filter { msg ->
             !msg.isBroadcast && (
@@ -214,22 +260,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         repository.callState,
         repository.signalingTransportState,
         repository.isLiveLocationSharing,
+        repository.uploadProgress,
+        repository.socialRelations,
+        repository.blockedUsers,
         localFlags
     ) { values ->
         val session = values[0] as UserSession?
         val users = values[1] as List<ChatUser>
         val messages = values[2] as List<ChatMessage>
         val threadReads = values[3] as Map<String, Long>
-        val posts = values[4] as List<SocialPost>
+        val rawPosts = values[4] as List<SocialPost>
         val comments = values[5] as Map<String, List<SocialComment>>
         val extras = values[6] as Map<String, UserProfileExtras>
-        val activities = values[7] as List<ActivityNotification>
+        val rawActivities = values[7] as List<ActivityNotification>
         val syncError = values[8] as String?
         val lastSyncMs = values[9] as Long?
         val callState = values[10] as CallUiState
         val transport = values[11] as SignalingTransportState
         val isLiveLoc = values[12] as Boolean
-        val flags = values[13] as LocalUiFlags
+        val uploadProgress = values[13] as UploadProgressState?
+        val socialRelations = values[14] as List<SocialRelation>
+        val blockedUsers = values[15] as List<BlockedUser>
+        val flags = values[16] as LocalUiFlags
+
+        val blockedIds = blockedUsers.map { it.userId.lowercase() }.toSet()
+        val visiblePosts = rawPosts.filterNot { blockedIds.contains(it.authorId.lowercase()) }
+        val visibleActivities = rawActivities.filterNot { blockedIds.contains(it.actorId.lowercase()) }
 
         ChatUiState(
             session = session,
@@ -237,10 +293,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             users = users,
             messages = messages,
             threadReads = threadReads,
-            socialPosts = posts,
+            socialPosts = visiblePosts,
             socialComments = comments,
             profileExtras = extras,
-            activityNotifications = activities,
+            activityNotifications = visibleActivities,
             searchQuery = flags.searchQuery,
             exploreQuery = flags.exploreQuery,
             selectedTargetId = flags.selectedTargetId,
@@ -256,6 +312,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             isSearchingRemote = flags.isSearchingRemote,
             isPublishingPost = flags.isPublishingPost,
             isUpdatingProfile = flags.isUpdatingProfile,
+            uploadProgress = uploadProgress,
+            socialRelations = socialRelations,
+            blockedUsers = blockedUsers,
             registerError = flags.registerError,
             sendError = flags.sendError,
             syncError = syncError,
@@ -527,17 +586,64 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sharePostToChat(post: SocialPost, targetUserId: String) {
-        val label = buildString {
-            append("Shared ${post.authorName}'s ${post.mediaType.name.lowercase()}: ")
-            if (post.caption.isNotBlank()) append(post.caption)
+        viewModelScope.launch {
+            localFlags.update { it.copy(isSending = true) }
+            when (val res = repository.sendSharedPostToChat(targetUserId, post)) {
+                is NetworkResult.Success -> {
+                    localFlags.update { it.copy(isSending = false) }
+                    _toastEvents.tryEmit("Shared to chat!")
+                }
+                is NetworkResult.Blocked -> {
+                    localFlags.update { it.copy(isSending = false, blockedAlertMessage = res.message) }
+                    _toastEvents.tryEmit(res.message)
+                }
+                is NetworkResult.Error -> {
+                    localFlags.update { it.copy(isSending = false) }
+                    _toastEvents.tryEmit(res.message)
+                }
+            }
         }
-        sendMessage(targetUserId, label) {
-            _toastEvents.tryEmit("Shared to chat!")
+    }
+
+    fun downloadVideo(urlOrUri: String, title: String) {
+        if (urlOrUri.isBlank()) {
+            _toastEvents.tryEmit("Video URL is not ready yet.")
+            return
+        }
+        viewModelScope.launch {
+            _toastEvents.tryEmit("Downloading video to Gallery…")
+            val result = MediaHelper.downloadVideoToGallery(getApplication(), urlOrUri, title)
+            result.onSuccess { pathInfo ->
+                _toastEvents.tryEmit("Saved to Gallery ($pathInfo)")
+            }.onFailure { err ->
+                _toastEvents.tryEmit(err.localizedMessage ?: "Failed to download video.")
+            }
         }
     }
 
     fun toggleFollowUser(targetUserId: String) {
         viewModelScope.launch { repository.toggleFollowUser(targetUserId) }
+    }
+
+    fun removeFollower(followerUserId: String) {
+        viewModelScope.launch {
+            repository.removeFollower(followerUserId)
+            _toastEvents.tryEmit("Follower removed.")
+        }
+    }
+
+    fun blockUser(targetUserId: String, targetName: String) {
+        viewModelScope.launch {
+            repository.blockUser(targetUserId, targetName)
+            _toastEvents.tryEmit("$targetName has been blocked.")
+        }
+    }
+
+    fun unblockUser(targetUserId: String) {
+        viewModelScope.launch {
+            repository.unblockUser(targetUserId)
+            _toastEvents.tryEmit("User unblocked.")
+        }
     }
 
     fun updateMyBio(bio: String) {

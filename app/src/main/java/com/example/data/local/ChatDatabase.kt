@@ -12,6 +12,7 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import com.example.data.model.ActivityNotification
 import com.example.data.model.ActivityType
+import com.example.data.model.BlockedUser
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatUser
 import com.example.data.model.LocationPayload
@@ -21,6 +22,7 @@ import com.example.data.model.MessageKind
 import com.example.data.model.SocialComment
 import com.example.data.model.SocialMediaType
 import com.example.data.model.SocialPost
+import com.example.data.model.SocialRelation
 import com.example.data.model.UserProfileExtras
 import kotlinx.coroutines.flow.Flow
 
@@ -326,6 +328,32 @@ data class AppliedSocialActionEntity(
     val appliedAtMs: Long = System.currentTimeMillis()
 )
 
+@Entity(tableName = "social_relations", primaryKeys = ["followerId", "followingId"])
+data class SocialRelationEntity(
+    val followerId: String,
+    val followingId: String,
+    val timestampMs: Long = System.currentTimeMillis()
+) {
+    fun toDomain(): SocialRelation = SocialRelation(
+        followerId = followerId,
+        followingId = followingId,
+        timestampMs = timestampMs
+    )
+}
+
+@Entity(tableName = "blocked_users")
+data class BlockedUserEntity(
+    @PrimaryKey val blockedUserId: String,
+    val blockedName: String,
+    val timestampMs: Long = System.currentTimeMillis()
+) {
+    fun toDomain(): BlockedUser = BlockedUser(
+        userId = blockedUserId,
+        name = blockedName,
+        timestampMs = timestampMs
+    )
+}
+
 @Dao
 interface ChatDao {
     @Query("SELECT * FROM users")
@@ -433,6 +461,42 @@ interface ChatDao {
 
     @Query("DELETE FROM activity_notifications")
     suspend fun clearActivityNotifications()
+
+    @Query("SELECT * FROM social_relations ORDER BY timestampMs DESC")
+    fun observeSocialRelations(): Flow<List<SocialRelationEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertSocialRelation(relation: SocialRelationEntity)
+
+    @Query("DELETE FROM social_relations WHERE followerId = :followerId AND followingId = :followingId")
+    suspend fun deleteSocialRelation(followerId: String, followingId: String)
+
+    @Query("SELECT * FROM social_relations WHERE followingId = :userId")
+    suspend fun getFollowersOf(userId: String): List<SocialRelationEntity>
+
+    @Query("SELECT * FROM social_relations WHERE followerId = :userId")
+    suspend fun getFollowingOf(userId: String): List<SocialRelationEntity>
+
+    @Query("DELETE FROM social_relations")
+    suspend fun clearSocialRelations()
+
+    @Query("SELECT * FROM blocked_users ORDER BY timestampMs DESC")
+    fun observeBlockedUsers(): Flow<List<BlockedUserEntity>>
+
+    @Query("SELECT blockedUserId FROM blocked_users")
+    suspend fun getBlockedUserIds(): List<String>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertBlockedUser(entity: BlockedUserEntity)
+
+    @Query("DELETE FROM blocked_users WHERE blockedUserId = :userId")
+    suspend fun deleteBlockedUser(userId: String)
+
+    @Query("SELECT EXISTS(SELECT 1 FROM blocked_users WHERE blockedUserId = :userId)")
+    suspend fun isUserBlocked(userId: String): Boolean
+
+    @Query("DELETE FROM blocked_users")
+    suspend fun clearBlockedUsers()
 }
 
 @Database(
@@ -444,9 +508,11 @@ interface ChatDao {
         SocialCommentEntity::class,
         ProfileExtraEntity::class,
         ActivityNotificationEntity::class,
-        AppliedSocialActionEntity::class
+        AppliedSocialActionEntity::class,
+        SocialRelationEntity::class,
+        BlockedUserEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {

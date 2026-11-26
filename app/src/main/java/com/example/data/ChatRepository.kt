@@ -4,17 +4,20 @@ import android.content.Context
 import android.net.Uri
 import com.example.data.local.ActivityNotificationEntity
 import com.example.data.local.AppliedSocialActionEntity
+import com.example.data.local.BlockedUserEntity
 import com.example.data.local.ChatDatabase
 import com.example.data.local.MessageEntity
 import com.example.data.local.ProfileExtraEntity
 import com.example.data.local.SocialCommentEntity
 import com.example.data.local.SocialPostEntity
+import com.example.data.local.SocialRelationEntity
 import com.example.data.local.ThreadReadEntity
 import com.example.data.local.UserEntity
 import com.example.data.model.ActivityNotification
 import com.example.data.model.ActivityType
 import com.example.data.model.BLOCKED_MESSAGE
 import com.example.data.model.BROADCAST_TARGET_ID
+import com.example.data.model.BlockedUser
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatUser
 import com.example.data.model.FeedPayload
@@ -28,6 +31,8 @@ import com.example.data.model.SocialActionEnvelope
 import com.example.data.model.SocialComment
 import com.example.data.model.SocialMediaType
 import com.example.data.model.SocialPost
+import com.example.data.model.SocialRelation
+import com.example.data.model.UploadProgressState
 import com.example.data.model.UserProfileExtras
 import com.example.data.model.UserSession
 import com.example.data.network.ApiService
@@ -131,8 +136,21 @@ class ChatRepository(
             list.map { it.toDomain() }
         }
 
+    val socialRelations: Flow<List<SocialRelation>> =
+        dao.observeSocialRelations().map { list ->
+            list.map { it.toDomain() }
+        }
+
+    val blockedUsers: Flow<List<BlockedUser>> =
+        dao.observeBlockedUsers().map { list ->
+            list.map { it.toDomain() }
+        }
+
     val callState: StateFlow<CallUiState> = webRTCClient.callState
     val signalingTransportState: StateFlow<SignalingTransportState> = signalingClient.transportState
+
+    private val _uploadProgress = MutableStateFlow<UploadProgressState?>(null)
+    val uploadProgress: StateFlow<UploadProgressState?> = _uploadProgress.asStateFlow()
 
     private val _isLiveLocationSharing = MutableStateFlow(false)
     val isLiveLocationSharing: StateFlow<Boolean> = _isLiveLocationSharing.asStateFlow()
@@ -339,11 +357,35 @@ class ChatRepository(
                 found += BackendJsonParser.parseUsers(resp.body()?.string().orEmpty())
             }
         }
+        if (supabaseClient.isConfigured()) {
+            found += supabaseClient.searchUsers(clean)
+        }
         if (found.isNotEmpty()) {
             val existingMap = dao.getAllUsers().associateBy { it.userId.lowercase(Locale.US) }
             val merged = mergeUserLists(found, existingMap)
             dao.upsertUsers(merged.map { UserEntity.fromDomain(it) })
             syncUserBiosToExtras(merged)
+        }
+
+        // Also pull that user's public posts/reels directly so Profile grid populates immediately
+        val remotePosts = mutableListOf<SocialPost>()
+        runCatching {
+            val userPostsResp = api.getUserPosts(clean)
+            if (userPostsResp.isSuccessful) {
+                remotePosts += BackendJsonParser.parseSocialPosts(userPostsResp.body()?.string().orEmpty())
+            }
+        }
+        runCatching {
+            val queryPostsResp = api.getPosts(userId = clean)
+            if (queryPostsResp.isSuccessful) {
+                remotePosts += BackendJsonParser.parseSocialPosts(queryPostsResp.body()?.string().orEmpty())
+            }
+        }
+        if (supabaseClient.isConfigured()) {
+            remotePosts += supabaseClient.fetchSocialPostsByAuthor(clean)
+        }
+        if (remotePosts.isNotEmpty()) {
+            dao.insertSocialPostsIfAbsent(remotePosts.distinctBy { it.id }.map { SocialPostEntity.fromDomain(it) })
         }
     }
 
@@ -406,6 +448,12 @@ class ChatRepository(
 
             if (supabaseClient.isConfigured()) {
                 collectedPosts += supabaseClient.fetchSocialPosts()
+            }
+            runCatching {
+                val postsResp = api.getPosts()
+                if (postsResp.isSuccessful) {
+                    collectedPosts += BackendJsonParser.parseSocialPosts(postsResp.body()?.string().orEmpty())
+                }
             }
 
             var blockedByPeerPoll = false
@@ -556,15 +604,35 @@ class ChatRepository(
     suspend fun sendMediaMessage(receiver: String, uri: Uri, forcedKind: MessageKind?): NetworkResult<Unit> {
         val currentUser = _session.value ?: return NetworkResult.Error("Not logged in.")
         val inspected = MediaHelper.inspectPickedUri(appContext, uri, forcedKind)
-        val uploaded = mediaUploadService.uploadUri(
-            uri = uri,
-            fileName = inspected.displayName,
-            mimeType = inspected.mimeType,
-            userId = currentUser.userId,
-            mediaTypeTag = inspected.kind.name.lowercase(Locale.US)
-        )
+        val uploadId = ("chat_upload_${System.currentTimeMillis()}").hashCode()
+        val label = when (inspected.kind) {
+            MessageKind.VIDEO -> "Uploading video…"
+            MessageKind.IMAGE -> "Uploading photo…"
+            MessageKind.AUDIO -> "Uploading audio…"
+            else -> "Uploading file…"
+        }
+        val uploaded = try {
+            _uploadProgress.value = UploadProgressState(label, 0)
+            notificationHelper.showUploadProgress(uploadId, label, 0)
+            mediaUploadService.uploadUri(
+                uri = uri,
+                fileName = inspected.displayName,
+                mimeType = inspected.mimeType,
+                userId = currentUser.userId,
+                mediaTypeTag = inspected.kind.name.lowercase(Locale.US),
+                onProgress = { pct ->
+                    _uploadProgress.value = UploadProgressState(label, pct)
+                    notificationHelper.showUploadProgress(uploadId, label, pct)
+                }
+            )
+        } finally {
+            _uploadProgress.value = null
+            notificationHelper.completeUploadNotification(uploadId, label, success = false)
+        }
         val finalPayload = if (uploaded != null) {
-            inspected.copy(localUri = uploaded.remoteUrl)
+            notificationHelper.completeUploadNotification(uploadId, label, success = true)
+            val compactThumb = if (uploaded.remoteUrl.contains("res.cloudinary.com", true)) "" else inspected.inlineDataBase64
+            inspected.copy(localUri = uploaded.remoteUrl, inlineDataBase64 = compactThumb)
         } else {
             inspected
         }
@@ -576,6 +644,64 @@ class ChatRepository(
             kind = finalPayload.kind,
             media = finalPayload
         )
+    }
+
+    suspend fun sendSharedPostToChat(targetUserId: String, post: SocialPost): NetworkResult<Unit> {
+        return when (post.mediaType) {
+            SocialMediaType.REEL -> {
+                if (post.mediaUri.isNotBlank()) {
+                    val captionTitle = post.caption.ifBlank { "Reel by ${post.authorName}" }
+                    val mediaPayload = MediaPayload(
+                        kind = MessageKind.VIDEO,
+                        displayName = captionTitle,
+                        mimeType = "video/mp4",
+                        sizeBytes = 0L,
+                        localUri = post.mediaUri,
+                        inlineDataBase64 = if (post.mediaUri.contains("res.cloudinary.com", true)) "" else post.inlineImageBase64
+                    )
+                    sendOutgoingMessage(
+                        receiver = targetUserId,
+                        wireText = BackendJsonParser.encodeMedia(mediaPayload),
+                        displayText = captionTitle,
+                        kind = MessageKind.VIDEO,
+                        media = mediaPayload
+                    )
+                } else {
+                    sendTextMessage(targetUserId, "🎬 Shared ${post.authorName}'s Reel: ${post.caption}")
+                }
+            }
+
+            SocialMediaType.PHOTO -> {
+                if (post.mediaUri.isNotBlank() || post.inlineImageBase64.isNotBlank()) {
+                    val title = post.caption.ifBlank { "Photo by ${post.authorName}" }
+                    val mediaPayload = MediaPayload(
+                        kind = MessageKind.IMAGE,
+                        displayName = title,
+                        mimeType = "image/jpeg",
+                        sizeBytes = 0L,
+                        localUri = post.mediaUri,
+                        inlineDataBase64 = if (post.mediaUri.startsWith("http", true)) "" else post.inlineImageBase64
+                    )
+                    sendOutgoingMessage(
+                        receiver = targetUserId,
+                        wireText = BackendJsonParser.encodeMedia(mediaPayload),
+                        displayText = title,
+                        kind = MessageKind.IMAGE,
+                        media = mediaPayload
+                    )
+                } else {
+                    sendTextMessage(targetUserId, "🖼️ Shared ${post.authorName}'s Photo: ${post.caption}")
+                }
+            }
+
+            SocialMediaType.QUOTE -> {
+                val text = buildString {
+                    append("✨ ${post.authorName}'s Quote")
+                    if (post.caption.isNotBlank()) append(":\n${post.caption}")
+                }
+                sendTextMessage(targetUserId, text)
+            }
+        }
     }
 
     suspend fun deleteChatMessage(message: ChatMessage): NetworkResult<Unit> {
@@ -738,71 +864,139 @@ class ChatRepository(
         val me = _session.value ?: return NetworkResult.Error("Not logged in.")
         var resolvedRemoteUrl = ""
         var compactThumbnailBase64 = ""
+        val uploadId = ("post_upload_${System.currentTimeMillis()}").hashCode()
+        val uploadLabel = when (mediaType) {
+            SocialMediaType.REEL -> "Uploading Reel…"
+            SocialMediaType.PHOTO -> "Uploading Photo…"
+            SocialMediaType.QUOTE -> "Publishing Quote…"
+        }
 
-        if (mediaUri != null) {
-            val forced = when (mediaType) {
-                SocialMediaType.PHOTO -> MessageKind.IMAGE
-                SocialMediaType.REEL -> MessageKind.VIDEO
-                SocialMediaType.QUOTE -> null
-            }
-            val inspected = MediaHelper.inspectPickedUri(appContext, mediaUri, forced)
-            val uploaded = mediaUploadService.uploadUri(
-                uri = mediaUri,
-                fileName = inspected.displayName,
-                mimeType = inspected.mimeType,
-                userId = me.userId,
-                mediaTypeTag = mediaType.name.lowercase(Locale.US)
-            )
-
-            if (mediaType == SocialMediaType.REEL) {
-                if (uploaded == null || uploaded.remoteUrl.isBlank()) {
-                    return NetworkResult.Error("Reel video upload failed. Check internet connection and try again.")
+        try {
+            if (mediaUri != null) {
+                val forced = when (mediaType) {
+                    SocialMediaType.PHOTO -> MessageKind.IMAGE
+                    SocialMediaType.REEL -> MessageKind.VIDEO
+                    SocialMediaType.QUOTE -> null
                 }
-                resolvedRemoteUrl = uploaded.remoteUrl
-                compactThumbnailBase64 = inspected.inlineDataBase64
-            } else if (mediaType == SocialMediaType.PHOTO) {
-                if (uploaded != null && uploaded.remoteUrl.isNotBlank()) {
+                _uploadProgress.value = UploadProgressState(uploadLabel, 2)
+                notificationHelper.showUploadProgress(uploadId, uploadLabel, 2)
+
+                val inspected = MediaHelper.inspectPickedUri(appContext, mediaUri, forced)
+                val uploaded = mediaUploadService.uploadUri(
+                    uri = mediaUri,
+                    fileName = inspected.displayName,
+                    mimeType = inspected.mimeType,
+                    userId = me.userId,
+                    mediaTypeTag = mediaType.name.lowercase(Locale.US),
+                    onProgress = { pct ->
+                        val clamped = pct.coerceIn(0, 99)
+                        _uploadProgress.value = UploadProgressState(uploadLabel, clamped)
+                        notificationHelper.showUploadProgress(uploadId, uploadLabel, clamped)
+                    }
+                )
+
+                if (mediaType == SocialMediaType.REEL) {
+                    if (uploaded == null || uploaded.remoteUrl.isBlank()) {
+                        notificationHelper.completeUploadNotification(uploadId, uploadLabel, success = false)
+                        return NetworkResult.Error("Reel video upload failed. Check internet connection and try again.")
+                    }
                     resolvedRemoteUrl = uploaded.remoteUrl
-                    compactThumbnailBase64 = ""
-                } else if (inspected.inlineDataBase64.isNotBlank()) {
-                    compactThumbnailBase64 = inspected.inlineDataBase64
-                } else {
-                    return NetworkResult.Error("Photo upload failed. Please try another photo.")
+                    // Keep wire payload ultra-light when Cloudinary can serve poster frames directly
+                    compactThumbnailBase64 = if (
+                        resolvedRemoteUrl.contains("res.cloudinary.com", ignoreCase = true) ||
+                        inspected.inlineDataBase64.length > 14_000
+                    ) {
+                        ""
+                    } else {
+                        inspected.inlineDataBase64
+                    }
+                } else if (mediaType == SocialMediaType.PHOTO) {
+                    if (uploaded != null && uploaded.remoteUrl.isNotBlank()) {
+                        resolvedRemoteUrl = uploaded.remoteUrl
+                        compactThumbnailBase64 = ""
+                    } else if (inspected.inlineDataBase64.isNotBlank()) {
+                        compactThumbnailBase64 = inspected.inlineDataBase64
+                    } else {
+                        notificationHelper.completeUploadNotification(uploadId, uploadLabel, success = false)
+                        return NetworkResult.Error("Photo upload failed. Please try another photo.")
+                    }
                 }
             }
-        }
 
-        val post = SocialPost(
-            id = "post_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}",
-            authorId = me.userId,
-            authorName = me.name,
-            mediaType = mediaType,
-            mediaUri = resolvedRemoteUrl,
-            inlineImageBase64 = compactThumbnailBase64,
-            caption = caption.trim(),
-            shayariTag = shayariTag.trim(),
-            timestampMs = System.currentTimeMillis(),
-            reachCount = 1
-        )
-        dao.upsertSocialPost(SocialPostEntity.fromDomain(post))
+            _uploadProgress.value = UploadProgressState("Publishing…", 99)
+            notificationHelper.showUploadProgress(uploadId, uploadLabel, 99)
 
-        val wire = BackendJsonParser.encodePost(post)
-        val sendResult = sendSocialWireEnvelope(
-            sender = me.userId,
-            receiver = BROADCAST_TARGET_ID,
-            wireText = wire,
-            mediaUrl = resolvedRemoteUrl.takeIf { it.isNotBlank() }
-        )
-        if (supabaseClient.isConfigured()) {
-            scope.launch { supabaseClient.upsertSocialPost(post) }
-        }
-        return when (sendResult) {
-            is NetworkResult.Blocked -> sendResult
-            is NetworkResult.Error -> {
-                // Keep locally visible while informing caller that server sync failed
-                NetworkResult.Error(sendResult.message)
+            val post = SocialPost(
+                id = "post_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}",
+                authorId = me.userId,
+                authorName = me.name,
+                mediaType = mediaType,
+                mediaUri = resolvedRemoteUrl,
+                inlineImageBase64 = compactThumbnailBase64,
+                caption = caption.trim(),
+                shayariTag = shayariTag.trim(),
+                timestampMs = System.currentTimeMillis(),
+                reachCount = 1
+            )
+            dao.upsertSocialPost(SocialPostEntity.fromDomain(post))
+
+            val postJson = JSONObject().apply {
+                put("id", post.id)
+                put("author_id", post.authorId)
+                put("authorId", post.authorId)
+                put("author_name", post.authorName)
+                put("authorName", post.authorName)
+                put("media_type", post.mediaType.name)
+                put("mediaType", post.mediaType.name)
+                if (post.mediaUri.isNotBlank()) {
+                    put("media_uri", post.mediaUri)
+                    put("mediaUrl", post.mediaUri)
+                }
+                if (post.inlineImageBase64.isNotBlank()) put("b64", post.inlineImageBase64)
+                put("caption", post.caption)
+                if (post.shayariTag.isNotBlank()) put("shayari_tag", post.shayariTag)
+                put("timestamp_ms", post.timestampMs)
+            }.toString()
+
+            var syncedToPostsApi = false
+            var syncedToSupabase = false
+            val wire = BackendJsonParser.encodePost(post)
+
+            val (postResp, supaOk, sendResult) = coroutineScope {
+                val pDef = async {
+                    runCatching {
+                        val r = api.createPost(postJson.toRequestBody(jsonMediaType))
+                        r.isSuccessful
+                    }.getOrDefault(false)
+                }
+                val sDef = async {
+                    if (supabaseClient.isConfigured()) supabaseClient.upsertSocialPost(post) else false
+                }
+                val wDef = async {
+                    sendSocialWireEnvelope(
+                        sender = me.userId,
+                        receiver = BROADCAST_TARGET_ID,
+                        wireText = wire,
+                        mediaUrl = resolvedRemoteUrl.takeIf { it.isNotBlank() }
+                    )
+                }
+                Triple(pDef.await(), sDef.await(), wDef.await())
             }
-            is NetworkResult.Success -> NetworkResult.Success(post)
+            syncedToPostsApi = postResp
+            syncedToSupabase = supaOk
+
+            _uploadProgress.value = UploadProgressState("Done", 100)
+            val anySucceeded = sendResult is NetworkResult.Success || syncedToPostsApi || syncedToSupabase
+            notificationHelper.completeUploadNotification(uploadId, uploadLabel, success = anySucceeded)
+
+            return when {
+                sendResult is NetworkResult.Blocked -> sendResult
+                anySucceeded -> NetworkResult.Success(post)
+                sendResult is NetworkResult.Error -> NetworkResult.Error(sendResult.message)
+                else -> NetworkResult.Success(post)
+            }
+        } finally {
+            _uploadProgress.value = null
         }
     }
 
@@ -936,6 +1130,18 @@ class ChatRepository(
         val nowFollowing = !targetExtra.isFollowedByMe
         val delta = if (nowFollowing) 1 else -1
 
+        if (nowFollowing) {
+            dao.upsertSocialRelation(
+                SocialRelationEntity(
+                    followerId = me.userId,
+                    followingId = targetUserId,
+                    timestampMs = System.currentTimeMillis()
+                )
+            )
+        } else {
+            dao.deleteSocialRelation(followerId = me.userId, followingId = targetUserId)
+        }
+
         dao.upsertProfileExtra(
             ProfileExtraEntity.fromDomain(
                 targetExtra.copy(
@@ -960,7 +1166,111 @@ class ChatRepository(
             targetUserId = targetUserId
         )
         recordActionId(action.actionId)
+        scope.launch {
+            runCatching {
+                val json = JSONObject().apply {
+                    put("follower_id", me.userId)
+                    put("following_id", targetUserId)
+                    put("action", if (nowFollowing) "follow" else "unfollow")
+                }.toString()
+                api.followAction(json.toRequestBody(jsonMediaType))
+            }
+        }
         sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
+    }
+
+    suspend fun removeFollower(followerUserId: String) {
+        val me = _session.value ?: return
+        if (followerUserId.equals(me.userId, ignoreCase = true)) return
+
+        dao.deleteSocialRelation(followerId = followerUserId, followingId = me.userId)
+        val myExtra = dao.getProfileExtra(me.userId)?.toDomain() ?: UserProfileExtras(userId = me.userId)
+        dao.upsertProfileExtra(
+            ProfileExtraEntity.fromDomain(
+                myExtra.copy(followersCount = (myExtra.followersCount - 1).coerceAtLeast(0))
+            )
+        )
+        val followerExtra = dao.getProfileExtra(followerUserId)?.toDomain() ?: UserProfileExtras(userId = followerUserId)
+        dao.upsertProfileExtra(
+            ProfileExtraEntity.fromDomain(
+                followerExtra.copy(followingCount = (followerExtra.followingCount - 1).coerceAtLeast(0))
+            )
+        )
+
+        val action = SocialActionEnvelope(
+            actionId = "rmf_${UUID.randomUUID()}",
+            actionType = "remove_follower",
+            actorId = me.userId,
+            actorName = me.name,
+            targetUserId = followerUserId
+        )
+        recordActionId(action.actionId)
+        sendSocialWireEnvelope(me.userId, BROADCAST_TARGET_ID, BackendJsonParser.encodeSocialAction(action))
+    }
+
+    suspend fun blockUser(targetUserId: String, targetName: String) {
+        val me = _session.value ?: return
+        val cleanId = targetUserId.trim()
+        if (cleanId.isEmpty() || cleanId.equals(me.userId, ignoreCase = true)) return
+
+        dao.upsertBlockedUser(
+            BlockedUserEntity(
+                blockedUserId = cleanId,
+                blockedName = targetName.ifBlank { cleanId },
+                timestampMs = System.currentTimeMillis()
+            )
+        )
+        // Clean up follow relationship locally if either side was following
+        val existingTargetExtra = dao.getProfileExtra(cleanId)?.toDomain()
+        if (existingTargetExtra?.isFollowedByMe == true) {
+            dao.upsertProfileExtra(
+                ProfileExtraEntity.fromDomain(
+                    existingTargetExtra.copy(
+                        isFollowedByMe = false,
+                        followersCount = (existingTargetExtra.followersCount - 1).coerceAtLeast(0)
+                    )
+                )
+            )
+            val myExtra = dao.getProfileExtra(me.userId)?.toDomain()
+            if (myExtra != null) {
+                dao.upsertProfileExtra(
+                    ProfileExtraEntity.fromDomain(
+                        myExtra.copy(followingCount = (myExtra.followingCount - 1).coerceAtLeast(0))
+                    )
+                )
+            }
+        }
+        dao.deleteSocialRelation(followerId = me.userId, followingId = cleanId)
+        dao.deleteSocialRelation(followerId = cleanId, followingId = me.userId)
+
+        scope.launch {
+            runCatching {
+                val json = JSONObject().apply {
+                    put("user_id", me.userId)
+                    put("target_user_id", cleanId)
+                    put("blocked_user_id", cleanId)
+                }.toString()
+                api.blockUser(json.toRequestBody(jsonMediaType))
+            }
+        }
+    }
+
+    suspend fun unblockUser(targetUserId: String) {
+        val me = _session.value ?: return
+        val cleanId = targetUserId.trim()
+        if (cleanId.isEmpty()) return
+
+        dao.deleteBlockedUser(cleanId)
+        scope.launch {
+            runCatching {
+                val json = JSONObject().apply {
+                    put("user_id", me.userId)
+                    put("target_user_id", cleanId)
+                    put("blocked_user_id", cleanId)
+                }.toString()
+                api.unblockUser(json.toRequestBody(jsonMediaType))
+            }
+        }
     }
 
     suspend fun updateMyBio(newBio: String): NetworkResult<Unit> {
@@ -1117,12 +1427,14 @@ class ChatRepository(
 
     private suspend fun applyIncomingSocialActions(actions: List<SocialActionEnvelope>) {
         val me = _session.value ?: return
+        val blockedIds = dao.getBlockedUserIds().map { it.lowercase(Locale.US) }.toSet()
         for (action in actions) {
             if (!processedSocialActionIds.add(action.actionId)) continue
             val inserted = dao.markSocialActionApplied(AppliedSocialActionEntity(action.actionId))
             if (inserted == -1L) continue
 
             val isMine = action.actorId.equals(me.userId, ignoreCase = true)
+            val isActorBlocked = action.actorId.lowercase(Locale.US) in blockedIds
 
             when (action.actionType) {
                 "like", "unlike" -> {
@@ -1138,7 +1450,7 @@ class ChatRepository(
                             )
                         )
                     )
-                    if (isLike && !isMine && post.authorId.equals(me.userId, ignoreCase = true)) {
+                    if (isLike && !isMine && !isActorBlocked && post.authorId.equals(me.userId, ignoreCase = true)) {
                         dao.insertActivityNotification(
                             ActivityNotificationEntity.fromDomain(
                                 ActivityNotification(
@@ -1177,7 +1489,7 @@ class ChatRepository(
                                 )
                             )
                         )
-                        if (!isMine && post.authorId.equals(me.userId, ignoreCase = true)) {
+                        if (!isMine && !isActorBlocked && post.authorId.equals(me.userId, ignoreCase = true)) {
                             dao.insertActivityNotification(
                                 ActivityNotificationEntity.fromDomain(
                                     ActivityNotification(
@@ -1205,7 +1517,7 @@ class ChatRepository(
                             )
                         )
                     )
-                    if (!isMine && post.authorId.equals(me.userId, ignoreCase = true)) {
+                    if (!isMine && !isActorBlocked && post.authorId.equals(me.userId, ignoreCase = true)) {
                         dao.insertActivityNotification(
                             ActivityNotificationEntity.fromDomain(
                                 ActivityNotification(
@@ -1225,6 +1537,22 @@ class ChatRepository(
                 "follow", "unfollow" -> {
                     val isFollow = action.actionType == "follow"
                     val delta = if (isFollow) 1 else -1
+                    if (action.actorId.isNotBlank() && action.targetUserId.isNotBlank()) {
+                        if (isFollow) {
+                            dao.upsertSocialRelation(
+                                SocialRelationEntity(
+                                    followerId = action.actorId,
+                                    followingId = action.targetUserId,
+                                    timestampMs = action.timestampMs
+                                )
+                            )
+                        } else {
+                            dao.deleteSocialRelation(
+                                followerId = action.actorId,
+                                followingId = action.targetUserId
+                            )
+                        }
+                    }
                     if (action.targetUserId.isNotBlank()) {
                         val targetExtra = dao.getProfileExtra(action.targetUserId)?.toDomain()
                             ?: UserProfileExtras(userId = action.targetUserId)
@@ -1248,7 +1576,7 @@ class ChatRepository(
                             )
                         )
                     }
-                    if (isFollow && !isMine &&
+                    if (isFollow && !isMine && !isActorBlocked &&
                         action.targetUserId.equals(me.userId, ignoreCase = true)
                     ) {
                         dao.insertActivityNotification(
@@ -1260,6 +1588,39 @@ class ChatRepository(
                                     actorName = action.actorName,
                                     postSnippet = "Started following you",
                                     timestampMs = action.timestampMs
+                                )
+                            )
+                        )
+                    }
+                }
+
+                "remove_follower" -> {
+                    // actorId removed targetUserId from actorId's followers list
+                    if (action.actorId.isNotBlank() && action.targetUserId.isNotBlank()) {
+                        dao.deleteSocialRelation(
+                            followerId = action.targetUserId,
+                            followingId = action.actorId
+                        )
+                        val actorExtra = dao.getProfileExtra(action.actorId)?.toDomain()
+                            ?: UserProfileExtras(userId = action.actorId)
+                        dao.upsertProfileExtra(
+                            ProfileExtraEntity.fromDomain(
+                                actorExtra.copy(
+                                    followersCount = (actorExtra.followersCount - 1).coerceAtLeast(0)
+                                )
+                            )
+                        )
+                        val removedFollowerExtra = dao.getProfileExtra(action.targetUserId)?.toDomain()
+                            ?: UserProfileExtras(userId = action.targetUserId)
+                        dao.upsertProfileExtra(
+                            ProfileExtraEntity.fromDomain(
+                                removedFollowerExtra.copy(
+                                    followingCount = (removedFollowerExtra.followingCount - 1).coerceAtLeast(0),
+                                    isFollowedByMe = if (action.targetUserId.equals(me.userId, true)) {
+                                        false
+                                    } else {
+                                        removedFollowerExtra.isFollowedByMe
+                                    }
                                 )
                             )
                         )
@@ -1330,12 +1691,15 @@ class ChatRepository(
         dao.clearProfileExtras()
         dao.clearActivityNotifications()
         dao.clearAppliedSocialActions()
+        dao.clearSocialRelations()
+        dao.clearBlockedUsers()
         sessionManager.resetSessionLock()
         _session.value = null
     }
 
     private suspend fun handleIncomingSignal(envelope: SignalingEnvelope) {
         val currentUser = _session.value ?: return
+        if (dao.isUserBlocked(envelope.sender)) return
         if (envelope.type == "read_receipt") {
             dao.updateOutgoingStatus(
                 senderId = currentUser.userId,
@@ -1380,6 +1744,7 @@ class ChatRepository(
         }
 
         val userLookup = users.associateBy { it.userId }
+        val blockedIds = dao.getBlockedUserIds().map { it.lowercase(Locale.US) }.toSet()
         val newlyNotified = mutableSetOf<String>()
 
         for (msg in messages) {
@@ -1388,9 +1753,10 @@ class ChatRepository(
             seenMessageKeys.add(key)
             newlyNotified.add(key)
 
+            val isSenderBlocked = msg.sender.lowercase(Locale.US) in blockedIds
             val isFromSomeoneElse = !msg.sender.equals(currentUser.userId, ignoreCase = true)
             val isAddressedToMe = msg.isBroadcast || msg.receiver.equals(currentUser.userId, ignoreCase = true)
-            if (isFromSomeoneElse && isAddressedToMe) {
+            if (isFromSomeoneElse && isAddressedToMe && !isSenderBlocked) {
                 val senderDisplay = msg.senderName
                     ?: userLookup[msg.sender]?.name
                     ?: msg.sender

@@ -21,6 +21,7 @@ class ChatNotificationHelper(private val context: Context) {
     companion object {
         const val CHANNEL_ID = "hello_sir_messages"
         const val CALL_CHANNEL_ID = "hello_sir_calls"
+        const val UPLOAD_CHANNEL_ID = "hello_sir_uploads"
         const val EXTRA_CHAT_TARGET = "extra_chat_target"
         const val EXTRA_OPEN_CALL = "extra_open_call"
     }
@@ -53,6 +54,18 @@ class ChatNotificationHelper(private val context: Context) {
                 setShowBadge(false)
             }
             manager.createNotificationChannel(callChannel)
+
+            val uploadChannel = NotificationChannel(
+                UPLOAD_CHANNEL_ID,
+                "Media Uploads",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Shows progress while uploading photos or Reels"
+                setSound(null, null)
+                enableVibration(false)
+                setShowBadge(false)
+            }
+            manager.createNotificationChannel(uploadChannel)
         }
     }
 
@@ -64,6 +77,43 @@ class ChatNotificationHelper(private val context: Context) {
             ) == PackageManager.PERMISSION_GRANTED
         } else {
             true
+        }
+    }
+
+    fun showUploadProgress(uploadId: Int, title: String, percent: Int) {
+        if (!hasNotificationPermission()) return
+        val clamped = percent.coerceIn(0, 100)
+        val notification = NotificationCompat.Builder(context, UPLOAD_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification_chat)
+            .setContentTitle(title)
+            .setContentText("$clamped%")
+            .setProgress(100, clamped, false)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .build()
+        runCatching {
+            NotificationManagerCompat.from(context).notify(uploadId, notification)
+        }
+    }
+
+    fun completeUploadNotification(uploadId: Int, title: String, success: Boolean) {
+        if (!hasNotificationPermission()) return
+        if (!success) {
+            runCatching { NotificationManagerCompat.from(context).cancel(uploadId) }
+            return
+        }
+        val notification = NotificationCompat.Builder(context, UPLOAD_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification_chat)
+            .setContentTitle(title)
+            .setContentText("Uploaded (100%)")
+            .setProgress(0, 0, false)
+            .setOngoing(false)
+            .setAutoCancel(true)
+            .setSilent(true)
+            .build()
+        runCatching {
+            NotificationManagerCompat.from(context).notify(uploadId, notification)
         }
     }
 

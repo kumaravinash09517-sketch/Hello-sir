@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,6 +29,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Chat
 import androidx.compose.material.icons.rounded.AddCircleOutline
+import androidx.compose.material.icons.rounded.Block
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CameraAlt
@@ -39,12 +41,15 @@ import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PrimaryTabRow
@@ -64,11 +69,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.data.model.BlockedUser
+import com.example.data.model.ChatUser
 import com.example.data.model.SocialMediaType
 import com.example.data.model.SocialPost
 import com.example.data.model.UserProfileExtras
@@ -96,6 +105,10 @@ fun ProfileScreen(
     onShareToChat: (SocialPost, String) -> Unit = { _, _ -> },
     onPublishPost: (SocialMediaType, Uri?, String, String) -> Unit,
     onOpenUserProfile: (String) -> Unit = {},
+    onDownloadVideo: (SocialPost) -> Unit = {},
+    onRemoveFollower: (String) -> Unit = {},
+    onBlockUser: (userId: String, name: String) -> Unit = { _, _ -> },
+    onUnblockUser: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val currentSession = uiState.session ?: return
@@ -112,6 +125,16 @@ fun ProfileScreen(
     val displayName = if (isMe) currentSession.name else matchedUser?.name ?: targetUserId
     val extras = uiState.profileExtras[targetUserId] ?: UserProfileExtras(userId = targetUserId)
     val avatarUrl = matchedUser?.avatarUrl
+    val isTargetBlocked = !isMe && uiState.isUserBlocked(targetUserId)
+
+    val followersList = remember(uiState.socialRelations, uiState.users, targetUserId) {
+        uiState.followersOf(targetUserId)
+    }
+    val followingList = remember(uiState.socialRelations, uiState.users, targetUserId) {
+        uiState.followingOf(targetUserId)
+    }
+    val displayedFollowersCount = maxOf(extras.followersCount, followersList.size)
+    val displayedFollowingCount = maxOf(extras.followingCount, followingList.size)
 
     val userPosts = remember(uiState.socialPosts, targetUserId) {
         uiState.socialPosts.filter { it.authorId.equals(targetUserId, ignoreCase = true) }
@@ -128,6 +151,8 @@ fun ProfileScreen(
     var bioDraft by remember(extras.bio) { mutableStateOf(extras.bio) }
     var selectedPostId by remember { mutableStateOf<String?>(null) }
     var showCreateSheet by remember { mutableStateOf(false) }
+    var followSheetInitialTab by remember { mutableStateOf<Int?>(null) }
+    var showBlockConfirm by remember { mutableStateOf(false) }
 
     val avatarPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -210,7 +235,8 @@ fun ProfileScreen(
             onToggleBookmark = onToggleBookmark,
             onAddComment = onAddComment,
             onRepost = onRepost,
-            onShareToChat = onShareToChat
+            onShareToChat = onShareToChat,
+            onDownloadVideo = onDownloadVideo
         )
     }
 
@@ -220,6 +246,67 @@ fun ProfileScreen(
             onPublish = { type, uri, caption ->
                 onPublishPost(type, uri, caption, "")
             }
+        )
+    }
+
+    if (showBlockConfirm) {
+        AlertDialog(
+            onDismissRequest = { showBlockConfirm = false },
+            title = { Text(if (isTargetBlocked) "Unblock $displayName?" else "Block $displayName?") },
+            text = {
+                Text(
+                    if (isTargetBlocked) {
+                        "$displayName will be able to message, call, and show up in your feed again."
+                    } else {
+                        "Blocking $displayName hides their posts, comments, messages, and incoming calls on your device."
+                    }
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (isTargetBlocked) {
+                            onUnblockUser(targetUserId)
+                        } else {
+                            onBlockUser(targetUserId, displayName)
+                        }
+                        showBlockConfirm = false
+                    },
+                    colors = if (!isTargetBlocked) {
+                        ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    } else {
+                        ButtonDefaults.buttonColors()
+                    }
+                ) {
+                    Text(if (isTargetBlocked) "Unblock" else "Block")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBlockConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    followSheetInitialTab?.let { initialSheetTab ->
+        FollowListBottomSheet(
+            initialTab = initialSheetTab,
+            isMe = isMe,
+            currentUserId = currentSession.userId,
+            followers = followersList,
+            following = followingList,
+            blockedUsers = uiState.blockedUsers,
+            profileExtras = uiState.profileExtras,
+            onDismiss = { followSheetInitialTab = null },
+            onOpenUserProfile = { uid ->
+                followSheetInitialTab = null
+                onOpenUserProfile(uid)
+            },
+            onToggleFollow = onToggleFollow,
+            onRemoveFollower = onRemoveFollower,
+            onBlockUser = onBlockUser,
+            onUnblockUser = onUnblockUser
         )
     }
 
@@ -268,6 +355,19 @@ fun ProfileScreen(
                         ) {
                             Icon(Icons.Rounded.Settings, contentDescription = "Device Lock & Settings")
                         }
+                    } else {
+                        IconButton(
+                            onClick = { showBlockConfirm = true },
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("profile_block_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Block,
+                                contentDescription = if (isTargetBlocked) "Unblock user" else "Block user",
+                                tint = if (isTargetBlocked) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
             )
@@ -280,7 +380,41 @@ fun ProfileScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            if (uiState.isPublishingPost || uiState.isUpdatingProfile || uiState.isRefreshing) {
+            val uploadProg = uiState.uploadProgress
+            if (uploadProg != null) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = uploadProg.label,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "${uploadProg.percent}%",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        LinearProgressIndicator(
+                            progress = { (uploadProg.percent / 100f).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            } else if (uiState.isPublishingPost || uiState.isUpdatingProfile || uiState.isRefreshing) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
 
@@ -345,8 +479,18 @@ fun ProfileScreen(
                                 horizontalArrangement = Arrangement.SpaceEvenly
                             ) {
                                 ProfileStat("${userPosts.size}", "Posts")
-                                ProfileStat("${extras.followersCount}", "Followers")
-                                ProfileStat("${extras.followingCount}", "Following")
+                                ProfileStat(
+                                    value = "$displayedFollowersCount",
+                                    label = "Followers",
+                                    onClick = { followSheetInitialTab = 0 },
+                                    testTag = "followers_stat_button"
+                                )
+                                ProfileStat(
+                                    value = "$displayedFollowingCount",
+                                    label = "Following",
+                                    onClick = { followSheetInitialTab = 1 },
+                                    testTag = "following_stat_button"
+                                )
                             }
                         }
 
@@ -407,34 +551,50 @@ fun ProfileScreen(
                         } else {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 Button(
                                     onClick = { onToggleFollow(targetUserId) },
                                     shape = RoundedCornerShape(12.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp),
                                     modifier = Modifier
-                                        .weight(1.2f)
+                                        .weight(1.1f)
                                         .heightIn(min = 48.dp)
                                         .testTag("profile_follow_button")
                                 ) {
-                                    Text(if (extras.isFollowedByMe) "Following" else "Follow")
+                                    Text(
+                                        text = if (extras.isFollowedByMe) "Following" else "Follow",
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
                                 }
                                 FilledTonalButton(
                                     onClick = { onOpenChat(targetUserId) },
                                     shape = RoundedCornerShape(12.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp),
                                     modifier = Modifier
                                         .weight(1f)
                                         .heightIn(min = 48.dp)
                                         .testTag("profile_chat_button")
                                 ) {
-                                    Icon(Icons.AutoMirrored.Rounded.Chat, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Icon(
+                                        Icons.AutoMirrored.Rounded.Chat,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Chat")
+                                    Text(
+                                        text = "Chat",
+                                        maxLines = 1,
+                                        softWrap = false
+                                    )
                                 }
                                 IconButton(
                                     onClick = { onStartCall(targetUserId, displayName, false) },
                                     modifier = Modifier
-                                        .minimumInteractiveComponentSize()
+                                        .size(44.dp)
                                         .testTag("profile_audio_call_button")
                                 ) {
                                     Icon(Icons.Rounded.Call, contentDescription = "Audio call", tint = MaterialTheme.colorScheme.primary)
@@ -442,10 +602,19 @@ fun ProfileScreen(
                                 IconButton(
                                     onClick = { onStartCall(targetUserId, displayName, true) },
                                     modifier = Modifier
-                                        .minimumInteractiveComponentSize()
+                                        .size(44.dp)
                                         .testTag("profile_video_call_button")
                                 ) {
                                     Icon(Icons.Rounded.Videocam, contentDescription = "Video call", tint = MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                            if (isTargetBlocked) {
+                                OutlinedButton(
+                                    onClick = { onUnblockUser(targetUserId) },
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Unblock @$targetUserId")
                                 }
                             }
                         }
@@ -531,8 +700,22 @@ fun ProfileScreen(
 }
 
 @Composable
-private fun ProfileStat(value: String, label: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+private fun ProfileStat(
+    value: String,
+    label: String,
+    onClick: (() -> Unit)? = null,
+    testTag: String? = null
+) {
+    val baseModifier = Modifier
+        .clip(RoundedCornerShape(10.dp))
+        .let { if (onClick != null) it.clickable(onClick = onClick) else it }
+        .let { if (testTag != null) it.testTag(testTag) else it }
+        .padding(horizontal = 8.dp, vertical = 4.dp)
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = baseModifier
+    ) {
         Text(
             text = value,
             style = MaterialTheme.typography.titleLarge,
@@ -543,5 +726,177 @@ private fun ProfileStat(value: String, label: String) {
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FollowListBottomSheet(
+    initialTab: Int,
+    isMe: Boolean,
+    currentUserId: String,
+    followers: List<ChatUser>,
+    following: List<ChatUser>,
+    blockedUsers: List<BlockedUser>,
+    profileExtras: Map<String, UserProfileExtras>,
+    onDismiss: () -> Unit,
+    onOpenUserProfile: (String) -> Unit,
+    onToggleFollow: (String) -> Unit,
+    onRemoveFollower: (String) -> Unit,
+    onBlockUser: (userId: String, name: String) -> Unit,
+    onUnblockUser: (String) -> Unit
+) {
+    val tabs = if (isMe) {
+        listOf("Followers (${followers.size})", "Following (${following.size})", "Blocked (${blockedUsers.size})")
+    } else {
+        listOf("Followers (${followers.size})", "Following (${following.size})")
+    }
+    var selectedTab by remember(initialTab) { mutableIntStateOf(initialTab.coerceIn(0, tabs.lastIndex)) }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            PrimaryTabRow(selectedTabIndex = selectedTab) {
+                tabs.forEachIndexed { idx, title ->
+                    Tab(
+                        selected = selectedTab == idx,
+                        onClick = { selectedTab = idx },
+                        text = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    )
+                }
+            }
+
+            if (selectedTab == 2 && isMe) {
+                if (blockedUsers.isEmpty()) {
+                    Text(
+                        text = "You haven't blocked anyone.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 24.dp)
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 320.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(blockedUsers, key = { it.userId }) { blocked ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                UserAvatar(
+                                    initials = blocked.name.take(2).uppercase(),
+                                    isOnline = false,
+                                    seedKey = blocked.userId,
+                                    size = 40.dp,
+                                    showPresenceDot = false
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(blocked.name, fontWeight = FontWeight.Bold, maxLines = 1)
+                                    Text(
+                                        "@${blocked.userId}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                OutlinedButton(onClick = { onUnblockUser(blocked.userId) }) {
+                                    Text("Unblock")
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                val activeList = if (selectedTab == 0) followers else following
+                if (activeList.isEmpty()) {
+                    Text(
+                        text = if (selectedTab == 0) "No followers recorded yet." else "Not following anyone yet.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 24.dp)
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 340.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(activeList, key = { it.userId }) { user ->
+                            val isSelfRow = user.userId.equals(currentUserId, ignoreCase = true)
+                            val isFollowed = profileExtras[user.userId]?.isFollowedByMe == true
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { onOpenUserProfile(user.userId) }
+                                    .padding(horizontal = 6.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                UserAvatar(
+                                    initials = user.initials,
+                                    isOnline = user.isOnline(),
+                                    seedKey = user.userId,
+                                    size = 40.dp,
+                                    avatarUrl = user.avatarUrl
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = user.name,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "@${user.userId}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1
+                                    )
+                                }
+                                if (!isSelfRow) {
+                                    if (selectedTab == 0 && isMe) {
+                                        TextButton(onClick = { onRemoveFollower(user.userId) }) {
+                                            Text("Remove", color = MaterialTheme.colorScheme.error)
+                                        }
+                                    } else {
+                                        OutlinedButton(
+                                            onClick = { onToggleFollow(user.userId) },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                        ) {
+                                            Text(if (isFollowed) "Unfollow" else "Follow")
+                                        }
+                                    }
+                                    IconButton(
+                                        onClick = { onBlockUser(user.userId, user.name) },
+                                        modifier = Modifier.size(36.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Block,
+                                            contentDescription = "Block user",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                        }
+                    }
+                }
+            }
+        }
     }
 }

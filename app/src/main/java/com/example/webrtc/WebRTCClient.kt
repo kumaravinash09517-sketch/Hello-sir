@@ -23,7 +23,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
+import org.webrtc.Camera1Enumerator
 import org.webrtc.Camera2Enumerator
+import org.webrtc.CameraEnumerationAndroid
+import org.webrtc.CameraEnumerator
 import org.webrtc.CameraVideoCapturer
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
@@ -62,6 +65,8 @@ data class CallUiState(
     val isMuted: Boolean = false,
     val isCameraEnabled: Boolean = true,
     val isSpeakerOn: Boolean = false,
+    val isFrontCamera: Boolean = true,
+    val hasRemoteVideoFrame: Boolean = false,
     val iceStatusLabel: String = "Initializing…",
     val durationSeconds: Long = 0L,
     val pendingOfferSdp: String? = null
@@ -71,11 +76,11 @@ data class CallUiState(
 
 /**
  * WhatsApp-grade global-internet WebRTC Audio & Video Calling engine:
- * - Google public STUN + OpenRelay public TURN servers for global NAT traversal
- * - Jitter buffer tuning + audio-prioritized bitrate & graceful video degradation
- * - Permanent ON camera capture with frame keep-alive watchdog & automatic recovery
+ * - Google public STUN + OpenRelay/Render TURN servers for global NAT traversal
+ * - Proper SetLocalDescription-before-Signaling ordering & thread-safe ICE buffering
+ * - Connection watchdog with automatic ICE restart and TURN-Relay fallback
+ * - Adaptive camera format selection (Camera2 -> Camera1 fallback) & frame keep-alive
  * - Automatic ICE restart on Wi-Fi <-> Cellular transitions via ConnectivityManager
- * - Foreground ActiveCallService synchronization for background / Recents continuity
  */
 class WebRTCClient(
     private val context: Context,
@@ -101,20 +106,34 @@ class WebRTCClient(
 
     private var localRenderer: SurfaceViewRenderer? = null
     private var remoteRenderer: SurfaceViewRenderer? = null
+    private var isFrontCameraActive: Boolean = true
+    private var captureWidth = 640
+    private var captureHeight = 480
+    private var captureFps = 24
 
     private var currentUserId: String = ""
     private var currentUserName: String = ""
     private var callTimerJob: Job? = null
     private var cameraWatchdogJob: Job? = null
+    private var connectionWatchdogJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile
     private var lastLocalFrameAtMs: Long = 0L
     @Volatile
     private var lastIceRestartAtMs: Long = 0L
     private var hasReceivedInitialNetwork = false
+    private var switchedToRelayFallback = false
 
     private val localFrameHeartbeatSink = VideoSink { _: VideoFrame ->
         lastLocalFrameAtMs = System.currentTimeMillis()
+    }
+
+    private val remoteFrameNotifierSink = VideoSink { _: VideoFrame ->
+        if (!_callState.value.hasRemoteVideoFrame) {
+            scope.launch {
+                _callState.update { it.copy(hasRemoteVideoFrame = true) }
+            }
+        }
     }
 
     private val pendingIceCandidates = mutableListOf<IceCandidate>()
@@ -128,13 +147,20 @@ class WebRTCClient(
         PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
         PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
         PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer(),
-        PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer(),
         PeerConnection.IceServer.builder("stun:global.stun.twilio.com:3478").createIceServer(),
         PeerConnection.IceServer.builder("turn:openrelay.metered.ca:80")
             .setUsername("openrelayproject")
             .setPassword("openrelayproject")
             .createIceServer(),
+        PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443")
+            .setUsername("openrelayproject")
+            .setPassword("openrelayproject")
+            .createIceServer(),
         PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443?transport=tcp")
+            .setUsername("openrelayproject")
+            .setPassword("openrelayproject")
+            .createIceServer(),
+        PeerConnection.IceServer.builder("turns:openrelay.metered.ca:443?transport=tcp")
             .setUsername("openrelayproject")
             .setPassword("openrelayproject")
             .createIceServer()
@@ -164,15 +190,28 @@ class WebRTCClient(
     }
 
     fun attachRenderers(localView: SurfaceViewRenderer?, remoteView: SurfaceViewRenderer?) {
-        localRenderer = localView
-        remoteRenderer = remoteView
-        localView?.let { localVideoTrack?.addSink(it) }
-        remoteView?.let { remoteVideoTrack?.addSink(it) }
+        if (localRenderer !== localView) {
+            localRenderer?.let { old -> runCatching { localVideoTrack?.removeSink(old) } }
+            localRenderer = localView
+            localView?.let { view ->
+                runCatching {
+                    view.setMirror(isFrontCameraActive)
+                    localVideoTrack?.addSink(view)
+                }
+            }
+        }
+        if (remoteRenderer !== remoteView) {
+            remoteRenderer?.let { old -> runCatching { remoteVideoTrack?.removeSink(old) } }
+            remoteRenderer = remoteView
+            remoteView?.let { view ->
+                runCatching { remoteVideoTrack?.addSink(view) }
+            }
+        }
     }
 
     fun detachRenderers() {
-        localRenderer?.let { localVideoTrack?.removeSink(it) }
-        remoteRenderer?.let { remoteVideoTrack?.removeSink(it) }
+        localRenderer?.let { old -> runCatching { localVideoTrack?.removeSink(old) } }
+        remoteRenderer?.let { old -> runCatching { remoteVideoTrack?.removeSink(old) } }
         localRenderer = null
         remoteRenderer = null
     }
@@ -181,6 +220,10 @@ class WebRTCClient(
         if (_callState.value.isActive || currentUserId.isBlank()) return
         ensureFactory()
         configureCallAudio(enableSpeaker = isVideo)
+        isFrontCameraActive = true
+        switchedToRelayFallback = false
+        synchronized(pendingIceCandidates) { pendingIceCandidates.clear() }
+        signalingClient.setActiveCallMode(true)
 
         _callState.value = CallUiState(
             status = CallStatus.OUTGOING_RINGING,
@@ -189,6 +232,7 @@ class WebRTCClient(
             isVideoCall = isVideo,
             isCameraEnabled = isVideo,
             isSpeakerOn = isVideo,
+            isFrontCamera = true,
             iceStatusLabel = "Calling via Global STUN/TURN…"
         )
         ActiveCallService.syncService(appContext, isActive = true)
@@ -201,24 +245,34 @@ class WebRTCClient(
             registerNetworkMonitor()
             if (isVideo) startCameraWatchdog()
 
+            val pc = peerConnection ?: return@launch
             val constraints = buildOfferAnswerConstraints(isVideo = isVideo, iceRestart = false)
-            peerConnection?.createOffer(object : SimpleSdpObserver() {
+            pc.createOffer(object : SimpleSdpObserver() {
                 override fun onCreateSuccess(desc: SessionDescription?) {
                     val sdp = desc ?: return
-                    peerConnection?.setLocalDescription(SimpleSdpObserver(), sdp)
-                    scope.launch(Dispatchers.IO) {
-                        signalingClient.sendSignal(
-                            SignalingEnvelope(
-                                signalId = "offer_${UUID.randomUUID()}",
-                                type = "offer",
-                                sender = currentUserId,
-                                senderName = currentUserName,
-                                receiver = targetUserId,
-                                sdp = sdp.description,
-                                isVideo = isVideo
-                            )
-                        )
-                    }
+                    pc.setLocalDescription(object : SimpleSdpObserver() {
+                        override fun onSetSuccess() {
+                            scope.launch(Dispatchers.IO) {
+                                signalingClient.sendSignal(
+                                    SignalingEnvelope(
+                                        signalId = "offer_${UUID.randomUUID()}",
+                                        type = "offer",
+                                        sender = currentUserId,
+                                        senderName = currentUserName,
+                                        receiver = targetUserId,
+                                        sdp = sdp.description,
+                                        isVideo = isVideo
+                                    )
+                                )
+                            }
+                        }
+
+                        override fun onSetFailure(error: String?) {
+                            scope.launch {
+                                _callState.update { it.copy(iceStatusLabel = "SDP setup failed • Retrying") }
+                            }
+                        }
+                    }, sdp)
                 }
             }, constraints)
         }
@@ -232,7 +286,26 @@ class WebRTCClient(
                     activeRemote.equals(envelope.sender, ignoreCase = true)
 
                 if (isSamePeerRenegotiation && envelope.sdp != null) {
-                    // Handle automatic ICE restart re-offer seamlessly without dropping call
+                    val pc = peerConnection
+                    val signalingState = pc?.signalingState()
+                    if (signalingState == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
+                        val isPolite = currentUserId.lowercase() < envelope.sender.lowercase()
+                        if (!isPolite && _callState.value.status == CallStatus.OUTGOING_RINGING) {
+                            return
+                        }
+                        if (isPolite) {
+                            pc.setLocalDescription(object : SimpleSdpObserver() {
+                                override fun onSetSuccess() {
+                                    handleIceRestartOffer(envelope.sdp, envelope.sender)
+                                }
+
+                                override fun onSetFailure(p0: String?) {
+                                    handleIceRestartOffer(envelope.sdp, envelope.sender)
+                                }
+                            }, SessionDescription(SessionDescription.Type.ROLLBACK, ""))
+                            return
+                        }
+                    }
                     handleIceRestartOffer(envelope.sdp, envelope.sender)
                     return
                 }
@@ -251,7 +324,8 @@ class WebRTCClient(
                     return
                 }
 
-                pendingIceCandidates.clear()
+                synchronized(pendingIceCandidates) { pendingIceCandidates.clear() }
+                signalingClient.setActiveCallMode(true)
                 _callState.value = CallUiState(
                     status = CallStatus.INCOMING_RINGING,
                     remoteUserId = envelope.sender,
@@ -259,6 +333,7 @@ class WebRTCClient(
                     isVideoCall = envelope.isVideo,
                     isCameraEnabled = envelope.isVideo,
                     isSpeakerOn = envelope.isVideo,
+                    isFrontCamera = true,
                     iceStatusLabel = if (envelope.isVideo) "Incoming WebRTC Video Call" else "Incoming WebRTC Audio Call",
                     pendingOfferSdp = envelope.sdp
                 )
@@ -267,15 +342,21 @@ class WebRTCClient(
 
             "answer" -> {
                 val sdpDesc = envelope.sdp ?: return
+                val pc = peerConnection ?: return
                 val answerSdp = SessionDescription(SessionDescription.Type.ANSWER, sdpDesc)
-                peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
+                pc.setRemoteDescription(object : SimpleSdpObserver() {
                     override fun onSetSuccess() {
                         flushPendingIce()
-                        _callState.update {
-                            it.copy(
-                                status = CallStatus.CONNECTING,
-                                iceStatusLabel = "Peer negotiated • Establishing ICE…"
-                            )
+                        scope.launch {
+                            if (_callState.value.status != CallStatus.CONNECTED) {
+                                _callState.update {
+                                    it.copy(
+                                        status = CallStatus.CONNECTING,
+                                        iceStatusLabel = "Peer negotiated • Establishing ICE…"
+                                    )
+                                }
+                                startConnectionWatchdog()
+                            }
                         }
                     }
                 }, answerSdp)
@@ -289,7 +370,9 @@ class WebRTCClient(
                 if (pc?.remoteDescription != null) {
                     pc.addIceCandidate(ice)
                 } else {
-                    pendingIceCandidates.add(ice)
+                    synchronized(pendingIceCandidates) {
+                        pendingIceCandidates.add(ice)
+                    }
                 }
             }
 
@@ -314,20 +397,23 @@ class WebRTCClient(
                 pc.createAnswer(object : SimpleSdpObserver() {
                     override fun onCreateSuccess(desc: SessionDescription?) {
                         val answer = desc ?: return
-                        pc.setLocalDescription(SimpleSdpObserver(), answer)
-                        scope.launch(Dispatchers.IO) {
-                            signalingClient.sendSignal(
-                                SignalingEnvelope(
-                                    signalId = "ans_${UUID.randomUUID()}",
-                                    type = "answer",
-                                    sender = currentUserId,
-                                    senderName = currentUserName,
-                                    receiver = remoteUserId,
-                                    sdp = answer.description,
-                                    isVideo = _callState.value.isVideoCall
-                                )
-                            )
-                        }
+                        pc.setLocalDescription(object : SimpleSdpObserver() {
+                            override fun onSetSuccess() {
+                                scope.launch(Dispatchers.IO) {
+                                    signalingClient.sendSignal(
+                                        SignalingEnvelope(
+                                            signalId = "ans_${UUID.randomUUID()}",
+                                            type = "answer",
+                                            sender = currentUserId,
+                                            senderName = currentUserName,
+                                            receiver = remoteUserId,
+                                            sdp = answer.description,
+                                            isVideo = _callState.value.isVideoCall
+                                        )
+                                    )
+                                }
+                            }
+                        }, answer)
                     }
                 }, constraints)
             }
@@ -341,6 +427,9 @@ class WebRTCClient(
 
         ensureFactory()
         configureCallAudio(enableSpeaker = withVideo)
+        isFrontCameraActive = true
+        switchedToRelayFallback = false
+        signalingClient.setActiveCallMode(true)
 
         _callState.update {
             it.copy(
@@ -348,6 +437,7 @@ class WebRTCClient(
                 isVideoCall = withVideo,
                 isCameraEnabled = withVideo,
                 isSpeakerOn = withVideo,
+                isFrontCamera = true,
                 iceStatusLabel = "Connecting P2P…"
             )
         }
@@ -360,29 +450,34 @@ class WebRTCClient(
             createPeerConnectionAndMedia(state.remoteUserId, withVideo)
             registerNetworkMonitor()
             if (withVideo) startCameraWatchdog()
+            startConnectionWatchdog()
 
+            val pc = peerConnection ?: return@launch
             val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, offerSdp)
-            peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
+            pc.setRemoteDescription(object : SimpleSdpObserver() {
                 override fun onSetSuccess() {
                     flushPendingIce()
                     val constraints = buildOfferAnswerConstraints(isVideo = withVideo, iceRestart = false)
-                    peerConnection?.createAnswer(object : SimpleSdpObserver() {
+                    pc.createAnswer(object : SimpleSdpObserver() {
                         override fun onCreateSuccess(desc: SessionDescription?) {
                             val answer = desc ?: return
-                            peerConnection?.setLocalDescription(SimpleSdpObserver(), answer)
-                            scope.launch(Dispatchers.IO) {
-                                signalingClient.sendSignal(
-                                    SignalingEnvelope(
-                                        signalId = "ans_${UUID.randomUUID()}",
-                                        type = "answer",
-                                        sender = currentUserId,
-                                        senderName = currentUserName,
-                                        receiver = state.remoteUserId,
-                                        sdp = answer.description,
-                                        isVideo = withVideo
-                                    )
-                                )
-                            }
+                            pc.setLocalDescription(object : SimpleSdpObserver() {
+                                override fun onSetSuccess() {
+                                    scope.launch(Dispatchers.IO) {
+                                        signalingClient.sendSignal(
+                                            SignalingEnvelope(
+                                                signalId = "ans_${UUID.randomUUID()}",
+                                                type = "answer",
+                                                sender = currentUserId,
+                                                senderName = currentUserName,
+                                                receiver = state.remoteUserId,
+                                                sdp = answer.description,
+                                                isVideo = withVideo
+                                            )
+                                        )
+                                    }
+                                }
+                            }, answer)
                         }
                     }, constraints)
                 }
@@ -419,13 +514,24 @@ class WebRTCClient(
         val next = !_callState.value.isCameraEnabled
         localVideoTrack?.setEnabled(next)
         if (next) {
-            runCatching { videoCapturer?.startCapture(720, 1280, 30) }
+            runCatching { videoCapturer?.startCapture(captureWidth, captureHeight, captureFps) }
+            lastLocalFrameAtMs = System.currentTimeMillis()
         }
         _callState.update { it.copy(isCameraEnabled = next) }
     }
 
     fun switchCamera() {
-        videoCapturer?.switchCamera(null)
+        videoCapturer?.switchCamera(object : CameraVideoCapturer.CameraSwitchHandler {
+            override fun onCameraSwitchDone(isFrontCamera: Boolean) {
+                isFrontCameraActive = isFrontCamera
+                scope.launch {
+                    localRenderer?.setMirror(isFrontCamera)
+                    _callState.update { it.copy(isFrontCamera = isFrontCamera) }
+                }
+            }
+
+            override fun onCameraSwitchError(errorDescription: String?) = Unit
+        })
     }
 
     fun toggleSpeaker() {
@@ -454,7 +560,6 @@ class WebRTCClient(
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            // Jitter buffer tuning for weak/fluctuating cellular connections
             audioJitterBufferMaxPackets = 120
             audioJitterBufferFastAccelerate = true
         }
@@ -477,19 +582,29 @@ class WebRTCClient(
                 }
             }
 
+            override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
+                scope.launch {
+                    when (newState) {
+                        PeerConnection.PeerConnectionState.CONNECTED -> markCallConnected()
+                        PeerConnection.PeerConnectionState.FAILED -> {
+                            _callState.update { it.copy(iceStatusLabel = "Retrying via TURN Relay…") }
+                            switchToRelayAndRestartIce()
+                        }
+                        PeerConnection.PeerConnectionState.DISCONNECTED -> {
+                            _callState.update { it.copy(iceStatusLabel = "Weak Network • Reconnecting ICE…") }
+                            triggerIceRestart(reason = "Peer disconnected")
+                        }
+                        PeerConnection.PeerConnectionState.CLOSED -> cleanupCallResources()
+                        else -> Unit
+                    }
+                }
+            }
+
             override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
                 scope.launch {
                     when (newState) {
                         PeerConnection.IceConnectionState.CONNECTED,
-                        PeerConnection.IceConnectionState.COMPLETED -> {
-                            _callState.update {
-                                it.copy(
-                                    status = CallStatus.CONNECTED,
-                                    iceStatusLabel = "Connected • Direct P2P Media"
-                                )
-                            }
-                            startCallTimer()
-                        }
+                        PeerConnection.IceConnectionState.COMPLETED -> markCallConnected()
                         PeerConnection.IceConnectionState.CHECKING -> {
                             _callState.update { it.copy(iceStatusLabel = "ICE Checking…") }
                         }
@@ -498,12 +613,10 @@ class WebRTCClient(
                             triggerIceRestart(reason = "ICE disconnected")
                         }
                         PeerConnection.IceConnectionState.FAILED -> {
-                            _callState.update { it.copy(iceStatusLabel = "Recovering connection…") }
-                            triggerIceRestart(reason = "ICE failed")
+                            _callState.update { it.copy(iceStatusLabel = "Switching to TURN Relay…") }
+                            switchToRelayAndRestartIce()
                         }
-                        PeerConnection.IceConnectionState.CLOSED -> {
-                            cleanupCallResources()
-                        }
+                        PeerConnection.IceConnectionState.CLOSED -> cleanupCallResources()
                         else -> Unit
                     }
                 }
@@ -512,10 +625,14 @@ class WebRTCClient(
             override fun onTrack(transceiver: RtpTransceiver?) {
                 val track = transceiver?.receiver?.track()
                 if (track is VideoTrack) {
-                    scope.launch {
-                        remoteVideoTrack = track
-                        remoteRenderer?.let { track.addSink(it) }
-                    }
+                    attachRemoteVideoTrack(track)
+                }
+            }
+
+            override fun onAddStream(stream: MediaStream?) {
+                val track = stream?.videoTracks?.firstOrNull()
+                if (track != null) {
+                    attachRemoteVideoTrack(track)
                 }
             }
 
@@ -523,7 +640,6 @@ class WebRTCClient(
             override fun onIceConnectionReceivingChange(p0: Boolean) {}
             override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState?) {}
             override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
-            override fun onAddStream(p0: MediaStream?) {}
             override fun onRemoveStream(p0: MediaStream?) {}
             override fun onDataChannel(p0: org.webrtc.DataChannel?) {}
             override fun onRenegotiationNeeded() {}
@@ -543,24 +659,93 @@ class WebRTCClient(
         audioSender = localAudioTrack?.let { peerConnection?.addTrack(it, listOf("HS_STREAM")) }
         tuneAudioSenderPriority()
 
-        // Permanent ON Camera Video Track with frame keep-alive sink
+        // Permanent ON Camera Video Track with supported format negotiation
         if (isVideo) {
             createCameraCapturer()?.let { capturer ->
                 videoCapturer = capturer
                 surfaceTextureHelper = SurfaceTextureHelper.create("HSCaptureThread", eglBase.eglBaseContext)
                 videoSource = factory.createVideoSource(capturer.isScreencast)
                 capturer.initialize(surfaceTextureHelper, appContext, videoSource?.capturerObserver)
-                runCatching { capturer.startCapture(720, 1280, 30) }
+                runCatching { capturer.startCapture(captureWidth, captureHeight, captureFps) }
                 lastLocalFrameAtMs = System.currentTimeMillis()
                 localVideoTrack = factory.createVideoTrack("HS_VIDEO_0", videoSource).apply {
                     setEnabled(true)
                     addSink(localFrameHeartbeatSink)
-                    localRenderer?.let { addSink(it) }
+                    localRenderer?.let { view ->
+                        view.setMirror(isFrontCameraActive)
+                        addSink(view)
+                    }
                 }
                 videoSender = localVideoTrack?.let { peerConnection?.addTrack(it, listOf("HS_STREAM")) }
                 tuneVideoSenderDegradation()
             }
         }
+    }
+
+    private fun attachRemoteVideoTrack(track: VideoTrack) {
+        scope.launch {
+            if (remoteVideoTrack !== track) {
+                remoteVideoTrack?.let { old ->
+                    runCatching { old.removeSink(remoteFrameNotifierSink) }
+                    remoteRenderer?.let { view -> runCatching { old.removeSink(view) } }
+                }
+                remoteVideoTrack = track
+                track.setEnabled(true)
+                runCatching { track.addSink(remoteFrameNotifierSink) }
+                remoteRenderer?.let { view -> runCatching { track.addSink(view) } }
+            }
+        }
+    }
+
+    private fun markCallConnected() {
+        connectionWatchdogJob?.cancel()
+        connectionWatchdogJob = null
+        val label = if (switchedToRelayFallback) {
+            "Connected • Global TURN Relay"
+        } else {
+            "Connected • Direct P2P Media"
+        }
+        _callState.update {
+            it.copy(
+                status = CallStatus.CONNECTED,
+                iceStatusLabel = label
+            )
+        }
+        startCallTimer()
+    }
+
+    private fun startConnectionWatchdog() {
+        connectionWatchdogJob?.cancel()
+        connectionWatchdogJob = scope.launch {
+            delay(9_000L)
+            if (isActive && _callState.value.status == CallStatus.CONNECTING) {
+                _callState.update { it.copy(iceStatusLabel = "Optimizing P2P route…") }
+                triggerIceRestart("Connecting timeout 9s")
+            }
+            delay(8_000L)
+            if (isActive && _callState.value.status == CallStatus.CONNECTING) {
+                _callState.update { it.copy(iceStatusLabel = "Switching to TURN Relay…") }
+                switchToRelayAndRestartIce()
+            }
+        }
+    }
+
+    private fun switchToRelayAndRestartIce() {
+        val pc = peerConnection ?: return
+        if (!switchedToRelayFallback) {
+            switchedToRelayFallback = true
+            val relayConfig = PeerConnection.RTCConfiguration(activeIceServers).apply {
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                iceTransportsType = PeerConnection.IceTransportsType.RELAY
+                bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+                rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+                continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                audioJitterBufferMaxPackets = 120
+                audioJitterBufferFastAccelerate = true
+            }
+            runCatching { pc.setConfiguration(relayConfig) }
+        }
+        triggerIceRestart("TURN relay fallback")
     }
 
     private fun tuneAudioSenderPriority() {
@@ -584,7 +769,7 @@ class WebRTCClient(
             params.encodings.forEach { enc ->
                 enc.minBitrateBps = 120_000
                 enc.maxBitrateBps = 900_000
-                enc.maxFramerate = 30
+                enc.maxFramerate = captureFps
                 enc.bitratePriority = 1.0
             }
             sender.parameters = params
@@ -598,7 +783,7 @@ class WebRTCClient(
                 delay(3_000L)
                 if (!_callState.value.isCameraEnabled) continue
                 val elapsedSinceFrame = System.currentTimeMillis() - lastLocalFrameAtMs
-                if (elapsedSinceFrame > 4_500L) {
+                if (elapsedSinceFrame > 5_000L) {
                     recoverVideoCapture()
                 }
             }
@@ -609,19 +794,18 @@ class WebRTCClient(
         val capturer = videoCapturer ?: return
         runCatching { capturer.stopCapture() }
         val restarted = runCatching {
-            capturer.startCapture(720, 1280, 30)
+            capturer.startCapture(captureWidth, captureHeight, captureFps)
             true
         }.getOrDefault(false)
 
         if (!restarted) {
-            // Re-create capturer if camera pipeline stalled on OEM hardware
             runCatching { capturer.dispose() }
             val fresh = createCameraCapturer() ?: return
             videoCapturer = fresh
             val helper = surfaceTextureHelper ?: SurfaceTextureHelper.create("HSCaptureThread", eglBase.eglBaseContext)
                 .also { surfaceTextureHelper = it }
             fresh.initialize(helper, appContext, videoSource?.capturerObserver)
-            runCatching { fresh.startCapture(720, 1280, 30) }
+            runCatching { fresh.startCapture(captureWidth, captureHeight, captureFps) }
         }
         lastLocalFrameAtMs = System.currentTimeMillis()
     }
@@ -660,7 +844,7 @@ class WebRTCClient(
 
     private fun triggerIceRestart(reason: String) {
         val now = System.currentTimeMillis()
-        if (now - lastIceRestartAtMs < 5_000L) return
+        if (now - lastIceRestartAtMs < 4_500L) return
         val pc = peerConnection ?: return
         val remoteId = _callState.value.remoteUserId
         if (remoteId.isBlank() || _callState.value.status == CallStatus.INCOMING_RINGING) return
@@ -674,36 +858,75 @@ class WebRTCClient(
         pc.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 val sdp = desc ?: return
-                pc.setLocalDescription(SimpleSdpObserver(), sdp)
-                scope.launch(Dispatchers.IO) {
-                    signalingClient.sendSignal(
-                        SignalingEnvelope(
-                            signalId = "ice_restart_${UUID.randomUUID()}",
-                            type = "offer",
-                            sender = currentUserId,
-                            senderName = currentUserName,
-                            receiver = remoteId,
-                            sdp = sdp.description,
-                            isVideo = _callState.value.isVideoCall
-                        )
-                    )
-                }
+                pc.setLocalDescription(object : SimpleSdpObserver() {
+                    override fun onSetSuccess() {
+                        scope.launch(Dispatchers.IO) {
+                            signalingClient.sendSignal(
+                                SignalingEnvelope(
+                                    signalId = "ice_restart_${UUID.randomUUID()}",
+                                    type = "offer",
+                                    sender = currentUserId,
+                                    senderName = currentUserName,
+                                    receiver = remoteId,
+                                    sdp = sdp.description,
+                                    isVideo = _callState.value.isVideoCall
+                                )
+                            )
+                        }
+                    }
+                }, sdp)
             }
         }, constraints)
     }
 
     private fun createCameraCapturer(): CameraVideoCapturer? {
-        val enumerator = Camera2Enumerator(appContext)
-        val deviceNames = enumerator.deviceNames
-        val front = deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
-        val chosen = front ?: deviceNames.firstOrNull() ?: return null
-        return enumerator.createCapturer(chosen, null)
+        val enumerators: List<CameraEnumerator> = listOfNotNull(
+            runCatching {
+                if (Camera2Enumerator.isSupported(appContext)) Camera2Enumerator(appContext) else null
+            }.getOrNull(),
+            Camera1Enumerator(true)
+        )
+        for (enumerator in enumerators) {
+            val deviceNames = runCatching { enumerator.deviceNames }.getOrNull().orEmpty()
+            if (deviceNames.isEmpty()) continue
+            val front = deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
+            val chosen = front ?: deviceNames.firstOrNull() ?: continue
+            isFrontCameraActive = enumerator.isFrontFacing(chosen)
+            selectBestFormat(enumerator, chosen)
+            val capturer = runCatching { enumerator.createCapturer(chosen, null) }.getOrNull()
+            if (capturer != null) return capturer
+        }
+        return null
+    }
+
+    private fun selectBestFormat(enumerator: CameraEnumerator, deviceName: String) {
+        val formats: List<CameraEnumerationAndroid.CaptureFormat> = runCatching {
+            enumerator.getSupportedFormats(deviceName)
+        }.getOrNull().orEmpty()
+        if (formats.isEmpty()) {
+            captureWidth = 640
+            captureHeight = 480
+            captureFps = 24
+            return
+        }
+        val preferred = formats
+            .filter { it.width in 480..1280 && it.height in 360..1280 }
+            .minByOrNull { kotlin.math.abs(it.width - 720) + kotlin.math.abs(it.height - 720) }
+            ?: formats.first()
+        captureWidth = preferred.width
+        captureHeight = preferred.height
+        val maxFps = (preferred.framerate.max / 1000).coerceIn(15, 30)
+        captureFps = maxFps
     }
 
     private fun flushPendingIce() {
         val pc = peerConnection ?: return
-        pendingIceCandidates.forEach { pc.addIceCandidate(it) }
-        pendingIceCandidates.clear()
+        val copy = synchronized(pendingIceCandidates) {
+            val list = pendingIceCandidates.toList()
+            pendingIceCandidates.clear()
+            list
+        }
+        copy.forEach { pc.addIceCandidate(it) }
     }
 
     private fun startCallTimer() {
@@ -747,15 +970,19 @@ class WebRTCClient(
     }
 
     fun cleanupCallResources() {
+        signalingClient.setActiveCallMode(false)
         callTimerJob?.cancel()
         callTimerJob = null
         cameraWatchdogJob?.cancel()
         cameraWatchdogJob = null
+        connectionWatchdogJob?.cancel()
+        connectionWatchdogJob = null
         unregisterNetworkMonitor()
-        pendingIceCandidates.clear()
+        synchronized(pendingIceCandidates) { pendingIceCandidates.clear() }
 
         detachRenderers()
         runCatching { localVideoTrack?.removeSink(localFrameHeartbeatSink) }
+        runCatching { remoteVideoTrack?.removeSink(remoteFrameNotifierSink) }
         runCatching { videoCapturer?.stopCapture() }
         runCatching { videoCapturer?.dispose() }
         videoCapturer = null
@@ -778,6 +1005,7 @@ class WebRTCClient(
         runCatching { peerConnection?.close() }
         runCatching { peerConnection?.dispose() }
         peerConnection = null
+        switchedToRelayFallback = false
 
         releaseCallAudio()
         _callState.value = CallUiState()

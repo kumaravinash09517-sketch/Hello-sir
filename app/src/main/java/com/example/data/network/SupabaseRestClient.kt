@@ -104,13 +104,18 @@ class SupabaseRestClient(
         val key = BackendConfig.activeSupabaseKey()
         if (key.isEmpty()) return@withContext false
 
+        val compactB64 = if (post.mediaUri.startsWith("http", ignoreCase = true) && post.inlineImageBase64.length > 16_000) {
+            ""
+        } else {
+            post.inlineImageBase64
+        }
         val payload = JSONObject().apply {
             put("id", post.id)
             put("author_id", post.authorId)
             put("author_name", post.authorName)
             put("media_type", post.mediaType.name)
             if (post.mediaUri.isNotBlank()) put("media_uri", post.mediaUri)
-            if (post.inlineImageBase64.isNotBlank()) put("b64", post.inlineImageBase64)
+            if (compactB64.isNotBlank()) put("b64", compactB64)
             put("caption", post.caption)
             if (post.shayariTag.isNotBlank()) put("shayari_tag", post.shayariTag)
             put("timestamp_ms", post.timestampMs)
@@ -147,7 +152,29 @@ class SupabaseRestClient(
             httpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@use emptyList()
                 val raw = resp.body?.string().orEmpty()
-                BackendJsonParser.parseFeed("""{"posts": $raw}""").posts
+                BackendJsonParser.parseSocialPosts(raw)
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun fetchSocialPostsByAuthor(authorId: String): List<com.example.data.model.SocialPost> = withContext(Dispatchers.IO) {
+        val key = BackendConfig.activeSupabaseKey()
+        val cleanId = authorId.trim()
+        if (key.isEmpty() || cleanId.isEmpty()) return@withContext emptyList()
+
+        val encoded = android.net.Uri.encode(cleanId)
+        val req = Request.Builder()
+            .url("${BackendConfig.SUPABASE_REST_URL}posts?select=*&author_id=eq.$encoded&order=timestamp_ms.desc&limit=50")
+            .header("apikey", key)
+            .header("Authorization", "Bearer $key")
+            .get()
+            .build()
+
+        runCatching {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use emptyList()
+                val raw = resp.body?.string().orEmpty()
+                BackendJsonParser.parseSocialPosts(raw)
             }
         }.getOrDefault(emptyList())
     }

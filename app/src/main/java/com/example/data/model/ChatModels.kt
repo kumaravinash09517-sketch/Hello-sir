@@ -244,12 +244,29 @@ data class ActivityNotification(
 
 data class SocialActionEnvelope(
     val actionId: String,
-    val actionType: String, // like, unlike, comment, follow, unfollow, repost, profile_bio
+    val actionType: String, // like, unlike, comment, follow, unfollow, remove_follower, block, unblock, repost, profile_bio
     val actorId: String,
     val actorName: String,
     val targetUserId: String = "",
     val postId: String = "",
     val payloadText: String = "",
+    val timestampMs: Long = System.currentTimeMillis()
+)
+
+data class UploadProgressState(
+    val label: String,
+    val percent: Int
+)
+
+data class SocialRelation(
+    val followerId: String,
+    val followingId: String,
+    val timestampMs: Long = System.currentTimeMillis()
+)
+
+data class BlockedUser(
+    val userId: String,
+    val name: String,
     val timestampMs: Long = System.currentTimeMillis()
 )
 

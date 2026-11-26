@@ -312,6 +312,8 @@ class MainActivity : ComponentActivity() {
                                                 session = session,
                                                 transportState = uiState.signalingTransportState,
                                                 notificationsEnabled = hasNotificationPermission,
+                                                blockedUsers = uiState.blockedUsers,
+                                                onUnblockUser = viewModel::unblockUser,
                                                 onRequestNotifications = {
                                                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                                                         !hasNotificationPermission
@@ -351,7 +353,13 @@ class MainActivity : ComponentActivity() {
                                                 onAddComment = viewModel::addComment,
                                                 onRepost = viewModel::repostPost,
                                                 onShareToChat = viewModel::sharePostToChat,
-                                                onPublishPost = viewModel::createSocialPost
+                                                onPublishPost = viewModel::createSocialPost,
+                                                onDownloadVideo = { post ->
+                                                    viewModel.downloadVideo(
+                                                        post.mediaUri,
+                                                        post.caption.ifBlank { "Reel_${post.authorId}" }
+                                                    )
+                                                }
                                             )
                                         }
 
@@ -372,6 +380,12 @@ class MainActivity : ComponentActivity() {
                                                         mediaUri = uri,
                                                         caption = caption
                                                     )
+                                                },
+                                                onDownloadVideo = { post ->
+                                                    viewModel.downloadVideo(
+                                                        post.mediaUri,
+                                                        post.caption.ifBlank { "Reel_${post.authorId}" }
+                                                    )
                                                 }
                                             )
                                         }
@@ -391,7 +405,13 @@ class MainActivity : ComponentActivity() {
                                                 onToggleBookmark = viewModel::toggleBookmarkPost,
                                                 onRepost = viewModel::repostPost,
                                                 onShareToChat = viewModel::sharePostToChat,
-                                                onSubmitSearch = viewModel::submitExploreSearch
+                                                onSubmitSearch = viewModel::submitExploreSearch,
+                                                onDownloadVideo = { post ->
+                                                    viewModel.downloadVideo(
+                                                        post.mediaUri,
+                                                        post.caption.ifBlank { "Reel_${post.authorId}" }
+                                                    )
+                                                }
                                             )
                                         }
 
@@ -423,7 +443,8 @@ class MainActivity : ComponentActivity() {
                                                 onStartCall = { id, name, video ->
                                                     launchCallWithPermission(id, name, video)
                                                 },
-                                                onDeleteMessage = viewModel::deleteMessage
+                                                onDeleteMessage = viewModel::deleteMessage,
+                                                onDownloadVideo = viewModel::downloadVideo
                                             )
                                         }
 
@@ -445,7 +466,16 @@ class MainActivity : ComponentActivity() {
                                                 onRepost = viewModel::repostPost,
                                                 onShareToChat = viewModel::sharePostToChat,
                                                 onPublishPost = viewModel::createSocialPost,
-                                                onOpenUserProfile = viewModel::openUserProfile
+                                                onOpenUserProfile = viewModel::openUserProfile,
+                                                onDownloadVideo = { post ->
+                                                    viewModel.downloadVideo(
+                                                        post.mediaUri,
+                                                        post.caption.ifBlank { "Reel_${post.authorId}" }
+                                                    )
+                                                },
+                                                onRemoveFollower = viewModel::removeFollower,
+                                                onBlockUser = viewModel::blockUser,
+                                                onUnblockUser = viewModel::unblockUser
                                             )
                                         }
                                     }

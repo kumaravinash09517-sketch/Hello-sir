@@ -1,13 +1,16 @@
 package com.example
 
+import com.example.data.model.BlockedUser
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatUser
 import com.example.data.model.DailyShayariProvider
+import com.example.data.model.MediaPayload
 import com.example.data.model.MessageDeliveryStatus
 import com.example.data.model.MessageKind
 import com.example.data.model.SocialActionEnvelope
 import com.example.data.model.SocialMediaType
 import com.example.data.model.SocialPost
+import com.example.data.model.SocialRelation
 import com.example.data.model.UserSession
 import com.example.data.network.BackendConfig
 import com.example.data.network.BackendJsonParser
@@ -57,6 +60,19 @@ class HeaderSanitizerAndSocialTest {
             "https://res.cloudinary.com/dvjhguyzo/image/upload/v1/hello_sir/test.png",
             BackendConfig.resolveUploadUrl("https://res.cloudinary.com/dvjhguyzo/image/upload/v1/hello_sir/test.png")
         )
+    }
+
+    @Test
+    fun backendConfig_derivesCloudinaryVideoThumbnailUrl() {
+        val thumb = BackendConfig.deriveVideoThumbnailUrl(
+            "https://res.cloudinary.com/dvjhguyzo/video/upload/v1700000000/hello_sir/reel_01.mp4?foo=1"
+        )
+        assertEquals(
+            "https://res.cloudinary.com/dvjhguyzo/video/upload/so_0,w_480,c_limit/v1700000000/hello_sir/reel_01.jpg",
+            thumb
+        )
+        assertEquals("", BackendConfig.deriveVideoThumbnailUrl("https://rendar2-o9gq.onrender.com/uploads/clip.mp4"))
+        assertEquals("", BackendConfig.deriveVideoThumbnailUrl(null))
     }
 
     @Test
@@ -170,6 +186,112 @@ class HeaderSanitizerAndSocialTest {
     }
 
     @Test
+    fun backendJsonParser_preservesDistinctIceCandidatesWithSameIdAndTimestamp() {
+        val signalJson = """
+            {
+              "signals": [
+                {
+                  "signal_id": "call_123",
+                  "type": "ice",
+                  "sender_id": "rohit",
+                  "receiver_id": "priya",
+                  "candidate": "candidate:1 1 UDP 2122260223 192.168.1.5 51000 typ host",
+                  "sdp_mid": "0",
+                  "sdp_m_line_index": 0,
+                  "timestamp": 1700000000
+                },
+                {
+                  "signal_id": "call_123",
+                  "type": "ice",
+                  "sender_id": "rohit",
+                  "receiver_id": "priya",
+                  "candidate": {
+                    "candidate": "candidate:2 1 UDP 1686052607 203.0.113.10 61000 typ srflx",
+                    "sdpMid": "0",
+                    "sdpMLineIndex": 0
+                  },
+                  "timestamp": 1700000000
+                }
+              ]
+            }
+        """.trimIndent()
+        val parsed = BackendJsonParser.parseCallSignals(signalJson)
+        assertEquals(2, parsed.size)
+        assertTrue(parsed[0].signalId != parsed[1].signalId)
+        assertEquals("candidate:2 1 UDP 1686052607 203.0.113.10 61000 typ srflx", parsed[1].candidate)
+    }
+
+    @Test
+    fun backendJsonParser_parsesPublicSocialPostsAndSharedReelCards() {
+        val supabaseArrayJson = """
+            [
+              {
+                "id": "reel_99",
+                "author_id": "rohit",
+                "author_name": "Rohit",
+                "media_type": "REEL",
+                "media_uri": "https://res.cloudinary.com/dvjhguyzo/video/upload/v1/hello_sir/reel_99.mp4",
+                "caption": "Morning sunrise reel",
+                "timestamp_ms": 1700000001000,
+                "likes": 12
+              }
+            ]
+        """.trimIndent()
+        val fromArray = BackendJsonParser.parseSocialPosts(supabaseArrayJson)
+        assertEquals(1, fromArray.size)
+        assertEquals("reel_99", fromArray.first().id)
+        assertEquals(SocialMediaType.REEL, fromArray.first().mediaType)
+        assertEquals("Morning sunrise reel", fromArray.first().caption)
+
+        val renderItemsJson = """
+            {
+              "items": [
+                {
+                  "id": "photo_77",
+                  "user_id": "priya",
+                  "name": "Priya",
+                  "media_type": "PHOTO",
+                  "media_url": "/uploads/photo_77.jpg",
+                  "caption": "Hello friends",
+                  "timestamp": 1700000002
+                }
+              ]
+            }
+        """.trimIndent()
+        val fromItems = BackendJsonParser.parseSocialPosts(renderItemsJson)
+        assertEquals(1, fromItems.size)
+        assertEquals("https://rendar2-o9gq.onrender.com/uploads/photo_77.jpg", fromItems.first().mediaUri)
+
+        // Round-trip shared Reel media payload in chat
+        val sharedReelMedia = MediaPayload(
+            kind = MessageKind.VIDEO,
+            displayName = "Morning sunrise reel",
+            mimeType = "video/mp4",
+            sizeBytes = 0L,
+            localUri = "https://res.cloudinary.com/dvjhguyzo/video/upload/v1/hello_sir/reel_99.mp4"
+        )
+        val encoded = BackendJsonParser.encodeMedia(sharedReelMedia).replace("\"", "\\\"")
+        val nowSec = System.currentTimeMillis() / 1000L
+        val chatJson = """
+            {
+              "users": [],
+              "messages": [
+                {"id": "msg_reel_1", "sender": "rohit", "receiver": "priya", "text": "$encoded", "timestamp": $nowSec}
+              ]
+            }
+        """.trimIndent()
+        val feed = BackendJsonParser.parseFeed(chatJson)
+        assertEquals(1, feed.messages.size)
+        val chatReel = feed.messages.first()
+        assertEquals(MessageKind.VIDEO, chatReel.kind)
+        assertEquals("Morning sunrise reel", chatReel.media?.displayName)
+        assertEquals(
+            "https://res.cloudinary.com/dvjhguyzo/video/upload/v1/hello_sir/reel_99.mp4",
+            chatReel.media?.localUri
+        )
+    }
+
+    @Test
     fun supabaseRestClient_parsesUsersResponse() {
         val raw = """
             [
@@ -267,6 +389,37 @@ class HeaderSanitizerAndSocialTest {
         val phoneState = state.copy(exploreQuery = "543210", searchQuery = "500001")
         assertEquals(listOf("avinash"), phoneState.exploredUsers.map { it.userId })
         assertEquals(listOf("ankit_01"), phoneState.sortedChatUsers.map { it.userId })
+    }
+
+    @Test
+    fun chatUiState_resolvesFollowersFollowingAndFiltersBlockedUsers() {
+        val me = UserSession(userId = "me", name = "Me", deviceLockId = "DEV-1", lockedAtMs = 1L)
+        val u1 = ChatUser(userId = "ankit", name = "Ankit", explicitOnline = true)
+        val u2 = ChatUser(userId = "priya", name = "Priya", explicitOnline = true)
+        val u3 = ChatUser(userId = "spammer", name = "Spammer", explicitOnline = true)
+
+        val state = ChatUiState(
+            session = me,
+            users = listOf(u1, u2, u3),
+            messages = listOf(
+                ChatMessage(id = "m1", sender = "spammer", receiver = "me", text = "Hi", timestampMs = 100L),
+                ChatMessage(id = "m2", sender = "ankit", receiver = "me", text = "Hello", timestampMs = 200L)
+            ),
+            socialRelations = listOf(
+                SocialRelation(followerId = "ankit", followingId = "me"),
+                SocialRelation(followerId = "me", followingId = "priya")
+            ),
+            blockedUsers = listOf(BlockedUser(userId = "spammer", name = "Spammer"))
+        )
+
+        assertTrue(state.isUserBlocked("SPAMMER"))
+        assertFalse(state.isUserBlocked("ankit"))
+        assertEquals(listOf("ankit"), state.followersOf("me").map { it.userId })
+        assertEquals(listOf("priya"), state.followingOf("me").map { it.userId })
+        assertEquals(listOf("ankit", "priya"), state.sortedChatUsers.map { it.userId })
+        assertEquals(listOf("ankit", "priya"), state.exploredUsers.map { it.userId })
+        assertEquals(2, state.onlineCount)
+        assertEquals(1, state.totalUnreadMessages)
     }
 
     @Test

@@ -60,14 +60,25 @@ class SignalingClient(
     @Volatile
     private var cachedIceServers: List<PeerConnection.IceServer> = emptyList()
 
+    @Volatile
+    private var highFrequencyCallMode: Boolean = false
+
     private val _transportState = MutableStateFlow(SignalingTransportState.DISCONNECTED)
     val transportState: StateFlow<SignalingTransportState> = _transportState.asStateFlow()
 
-    private val _incomingSignals = MutableSharedFlow<SignalingEnvelope>(extraBufferCapacity = 64)
+    private val _incomingSignals = MutableSharedFlow<SignalingEnvelope>(extraBufferCapacity = 128)
     val incomingSignals: SharedFlow<SignalingEnvelope> = _incomingSignals.asSharedFlow()
 
     private val _blockedSignals = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val blockedSignals: SharedFlow<String> = _blockedSignals.asSharedFlow()
+
+    fun setActiveCallMode(active: Boolean) {
+        val changed = highFrequencyCallMode != active
+        highFrequencyCallMode = active
+        if (changed && active && !isStopped) {
+            currentUserId?.let { startCallPolling(it) }
+        }
+    }
 
     fun connect(userId: String) {
         if (currentUserId == userId && !isStopped && pollJob?.isActive == true) return
@@ -83,6 +94,7 @@ class SignalingClient(
 
     fun disconnect() {
         isStopped = true
+        highFrequencyCallMode = false
         currentUserId = null
         reconnectJob?.cancel()
         reconnectJob = null
@@ -154,11 +166,12 @@ class SignalingClient(
                         onRestSignalsReceived(signals)
                     }
                 }
-                if (tick % 3 == 1) {
+                val activeModulo = if (highFrequencyCallMode) 4 else 3
+                if (tick % activeModulo == 1) {
                     fetchActiveCalls(userId)
                 }
                 tick++
-                delay(1_800L)
+                delay(if (highFrequencyCallMode) 600L else 1_800L)
             }
         }
     }
@@ -176,8 +189,18 @@ class SignalingClient(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                BackendJsonParser.tryParseSignalJson(text)?.let { env ->
-                    dispatchIfNew(env)
+                val signals = BackendJsonParser.parseCallSignals(text)
+                if (signals.isNotEmpty()) {
+                    onRestSignalsReceived(signals)
+                } else {
+                    BackendJsonParser.tryParseSignalJson(text)?.let { env ->
+                        val me = currentUserId
+                        if (me != null && !env.sender.equals(me, ignoreCase = true) &&
+                            (env.receiver.isBlank() || env.receiver.equals(me, ignoreCase = true))
+                        ) {
+                            dispatchIfNew(env)
+                        }
+                    }
                 }
             }
 
@@ -200,7 +223,7 @@ class SignalingClient(
     private fun scheduleReconnect(userId: String) {
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
-            delay(8_000L)
+            delay(5_000L)
             if (isActive && !isStopped && currentUserId == userId) {
                 openWebSocket(userId)
             }
@@ -258,7 +281,7 @@ class SignalingClient(
             put("timestamp_ms", envelope.timestampMs)
         }.toString()
 
-        val signalResp = runCatching {
+        var signalResp = runCatching {
             apiService.sendCallSignal(signalBody.toRequestBody(jsonMediaType))
         }.getOrNull()
 
@@ -267,7 +290,14 @@ class SignalingClient(
             return
         }
 
-        // Fallback/compat: also mirror read_receipt via /api/messages if needed
+        if ((signalResp == null || !signalResp.isSuccessful) && envelope.type != "read_receipt") {
+            delay(220L)
+            signalResp = runCatching {
+                apiService.sendCallSignal(signalBody.toRequestBody(jsonMediaType))
+            }.getOrNull()
+        }
+
+        // Fallback/compat: also mirror via /api/messages if signal endpoint returned error
         if (signalResp == null || !signalResp.isSuccessful) {
             val msgFallback = JSONObject().apply {
                 put("sender_id", envelope.sender)

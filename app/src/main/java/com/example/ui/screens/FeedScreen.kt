@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -93,6 +94,7 @@ fun FeedScreen(
     onRepost: (String) -> Unit,
     onShareToChat: (SocialPost, String) -> Unit,
     onPublishPost: (SocialMediaType, Uri?, String, String) -> Unit,
+    onDownloadVideo: (SocialPost) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -107,6 +109,7 @@ fun FeedScreen(
     var activeCommentsPostId by remember { mutableStateOf<String?>(null) }
     var activeSharePost by remember { mutableStateOf<SocialPost?>(null) }
     var fullScreenPostId by remember { mutableStateOf<String?>(null) }
+    var storyViewerUserId by remember { mutableStateOf<String?>(null) }
     var showCreateSheet by remember { mutableStateOf(false) }
     var createPrefillCaption by remember { mutableStateOf("") }
     var createInitialType by remember { mutableStateOf(SocialMediaType.PHOTO) }
@@ -123,14 +126,23 @@ fun FeedScreen(
     }
 
     if (fullScreenPostId != null) {
+        val viewerPosts = if (storyViewerUserId != null) {
+            uiState.socialPosts.filter { it.authorId.equals(storyViewerUserId, ignoreCase = true) }
+                .ifEmpty { uiState.socialPosts }
+        } else {
+            uiState.socialPosts
+        }
         SocialPostViewerDialog(
-            posts = uiState.socialPosts,
+            posts = viewerPosts,
             initialPostId = fullScreenPostId!!,
             currentUserId = currentUserId,
             users = uiState.users,
             commentsByPost = uiState.socialComments,
             profileExtras = uiState.profileExtras,
-            onDismiss = { fullScreenPostId = null },
+            onDismiss = {
+                fullScreenPostId = null
+                storyViewerUserId = null
+            },
             onOpenUserProfile = onOpenUserProfile,
             onOpenChat = onOpenChat,
             onToggleFollow = onToggleFollow,
@@ -138,7 +150,8 @@ fun FeedScreen(
             onToggleBookmark = onToggleBookmark,
             onAddComment = onAddComment,
             onRepost = onRepost,
-            onShareToChat = onShareToChat
+            onShareToChat = onShareToChat,
+            onDownloadVideo = onDownloadVideo
         )
     }
 
@@ -250,7 +263,41 @@ fun FeedScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            if (uiState.isRefreshing || uiState.isPublishingPost) {
+            val uploadProg = uiState.uploadProgress
+            if (uploadProg != null) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = uploadProg.label,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "${uploadProg.percent}%",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        LinearProgressIndicator(
+                            progress = { (uploadProg.percent / 100f).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            } else if (uiState.isRefreshing || uiState.isPublishingPost) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
 
@@ -273,14 +320,29 @@ fun FeedScreen(
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                             contentPadding = PaddingValues(vertical = 4.dp)
                         ) {
-                            items(uiState.users, key = { "story_${it.userId}" }) { user ->
+                            items(
+                                uiState.users.filterNot { uiState.isUserBlocked(it.userId) },
+                                key = { "story_${it.userId}" }
+                            ) { user ->
                                 val isOnline = user.isOnline()
+                                val userLatestPost = remember(uiState.socialPosts, user.userId) {
+                                    uiState.socialPosts.firstOrNull {
+                                        it.authorId.equals(user.userId, ignoreCase = true)
+                                    }
+                                }
                                 Column(
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                     modifier = Modifier
                                         .width(68.dp)
                                         .clip(RoundedCornerShape(14.dp))
-                                        .clickable { onOpenUserProfile(user.userId) }
+                                        .clickable {
+                                            if (userLatestPost != null) {
+                                                storyViewerUserId = user.userId
+                                                fullScreenPostId = userLatestPost.id
+                                            } else {
+                                                onOpenUserProfile(user.userId)
+                                            }
+                                        }
                                         .padding(vertical = 2.dp)
                                 ) {
                                     Box(
@@ -405,7 +467,11 @@ fun FeedScreen(
                                 onOpenShare = { activeSharePost = it },
                                 onToggleBookmark = onToggleBookmark,
                                 authorAvatarUrl = authorAvatar,
-                                onOpenFullScreen = { fullScreenPostId = it.id }
+                                onOpenFullScreen = {
+                                    storyViewerUserId = null
+                                    fullScreenPostId = it.id
+                                },
+                                onDownloadVideo = onDownloadVideo
                             )
                         }
                     }

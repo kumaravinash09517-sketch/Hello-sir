@@ -24,6 +24,7 @@ import androidx.compose.material.icons.rounded.AddCircleOutline
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.BookmarkBorder
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.Share
@@ -33,6 +34,7 @@ import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -72,6 +74,7 @@ fun ReelsScreen(
     onRepost: (String) -> Unit,
     onShareToChat: (SocialPost, String) -> Unit,
     onPublishReel: (Uri?, String) -> Unit,
+    onDownloadVideo: (SocialPost) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val currentUserId = uiState.session?.userId.orEmpty()
@@ -224,6 +227,15 @@ fun ReelsScreen(
                             contentDescription = "Share reel",
                             onClick = { activeSharePost = reel }
                         )
+                        if (reel.mediaUri.isNotBlank()) {
+                            ReelActionButton(
+                                icon = Icons.Rounded.Download,
+                                tint = Color.White,
+                                count = "Download",
+                                contentDescription = "Download reel",
+                                onClick = { onDownloadVideo(reel) }
+                            )
+                        }
                         ReelActionButton(
                             icon = if (reel.isBookmarkedByMe) Icons.Rounded.Bookmark else Icons.Rounded.BookmarkBorder,
                             tint = if (reel.isBookmarkedByMe) Color(0xFF4ADE80) else Color.White,
@@ -318,32 +330,60 @@ fun ReelsScreen(
         }
 
         // Top overlay header
-        Row(
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "Reels",
-                style = MaterialTheme.typography.titleLarge,
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
-            TextButton(
-                onClick = { showCreateReelSheet = true },
-                modifier = Modifier.testTag("create_reel_button")
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.AddCircleOutline,
-                    contentDescription = null,
-                    tint = Color.White
+                Text(
+                    text = "Reels",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold
                 )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("New Reel", color = Color.White, fontWeight = FontWeight.SemiBold)
+                TextButton(
+                    onClick = { showCreateReelSheet = true },
+                    modifier = Modifier.testTag("create_reel_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.AddCircleOutline,
+                        contentDescription = null,
+                        tint = Color.White
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("New Reel", color = Color.White, fontWeight = FontWeight.SemiBold)
+                }
+            }
+            uiState.uploadProgress?.let { progress ->
+                Surface(
+                    color = Color.Black.copy(alpha = 0.72f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                        Text(
+                            text = "${progress.label} ${progress.percent}%",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        LinearProgressIndicator(
+                            progress = { (progress.percent / 100f).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
             }
         }
     }

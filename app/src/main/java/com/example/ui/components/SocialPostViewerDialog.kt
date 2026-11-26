@@ -32,6 +32,7 @@ import androidx.compose.material.icons.automirrored.rounded.Chat
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.BookmarkBorder
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.Share
@@ -92,7 +93,8 @@ fun SocialPostViewerDialog(
     onToggleBookmark: (String) -> Unit,
     onAddComment: (postId: String, text: String) -> Unit,
     onRepost: (String) -> Unit,
-    onShareToChat: (SocialPost, String) -> Unit
+    onShareToChat: (SocialPost, String) -> Unit,
+    onDownloadVideo: (SocialPost) -> Unit = {}
 ) {
     if (posts.isEmpty()) return
     val initialIndex = remember(posts, initialPostId) {
@@ -399,6 +401,16 @@ fun SocialPostViewerDialog(
                             onClick = { activeSharePost = post },
                             testTag = "viewer_share_button"
                         )
+                        if (post.mediaType == SocialMediaType.REEL && post.mediaUri.isNotBlank()) {
+                            ViewerActionButton(
+                                icon = Icons.Rounded.Download,
+                                tint = Color.White,
+                                label = "Download",
+                                contentDescription = "Download Reel",
+                                onClick = { onDownloadVideo(post) },
+                                testTag = "viewer_download_button"
+                            )
+                        }
                         ViewerActionButton(
                             icon = if (post.isBookmarkedByMe) Icons.Rounded.Bookmark else Icons.Rounded.BookmarkBorder,
                             tint = if (post.isBookmarkedByMe) Color(0xFF4ADE80) else Color.White,

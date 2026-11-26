@@ -103,9 +103,14 @@ fun CallScreen(
                         remoteViewRef = this
                     }
                 },
+                update = { view ->
+                    if (remoteViewRef !== view) {
+                        remoteViewRef = view
+                    }
+                },
                 onRelease = { renderer ->
                     runCatching { renderer.release() }
-                    remoteViewRef = null
+                    if (remoteViewRef === renderer) remoteViewRef = null
                 },
                 modifier = Modifier.fillMaxSize()
             )
@@ -126,15 +131,21 @@ fun CallScreen(
                         SurfaceViewRenderer(ctx).apply {
                             init(webRTCClient.eglBase.eglBaseContext, null)
                             setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                            setMirror(true)
+                            setMirror(callState.isFrontCamera)
                             setZOrderMediaOverlay(true)
                             setEnableHardwareScaler(true)
                             localViewRef = this
                         }
                     },
+                    update = { view ->
+                        view.setMirror(callState.isFrontCamera)
+                        if (localViewRef !== view) {
+                            localViewRef = view
+                        }
+                    },
                     onRelease = { renderer ->
                         runCatching { renderer.release() }
-                        localViewRef = null
+                        if (localViewRef === renderer) localViewRef = null
                     },
                     modifier = Modifier.fillMaxSize()
                 )
@@ -191,7 +202,7 @@ fun CallScreen(
                     )
                 }
 
-                if (!callState.isVideoCall || callState.status != CallStatus.CONNECTED) {
+                if (!callState.isVideoCall || (callState.status != CallStatus.CONNECTED && !callState.hasRemoteVideoFrame)) {
                     Spacer(modifier = Modifier.height(20.dp))
                     val initials = callState.remoteUserName.trim().take(2).uppercase()
                         .ifBlank { callState.remoteUserId.take(2).uppercase() }

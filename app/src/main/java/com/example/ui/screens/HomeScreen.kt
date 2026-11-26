@@ -87,6 +87,7 @@ fun HomeScreen(
     onSendMedia: (receiver: String, uri: Uri, kind: MessageKind?) -> Unit,
     onStartCall: (targetUserId: String, targetUserName: String, isVideo: Boolean) -> Unit,
     onDeleteMessage: (ChatMessage) -> Unit = {},
+    onDownloadVideo: (url: String, title: String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
     val currentSession = uiState.session ?: return
@@ -133,6 +134,7 @@ fun HomeScreen(
                     onSendMedia = onSendMedia,
                     onStartCall = onStartCall,
                     onDeleteMessage = onDeleteMessage,
+                    onDownloadVideo = onDownloadVideo,
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -155,7 +157,8 @@ fun HomeScreen(
                     onStopLiveLocation = onStopLiveLocation,
                     onSendMedia = onSendMedia,
                     onStartCall = onStartCall,
-                    onDeleteMessage = onDeleteMessage
+                    onDeleteMessage = onDeleteMessage,
+                    onDownloadVideo = onDownloadVideo
                 )
             } else {
                 UserDirectoryPane(

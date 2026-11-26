@@ -130,8 +130,30 @@ object BackendJsonParser {
             else -> optStringFirst(obj, "call_type", "media_type")
                 ?.equals("video", ignoreCase = true) ?: false
         }
-        val signalId = optStringFirst(obj, "signal_id", "signalId", "id", "call_id")
-            ?: "${normalizedType}_${sender}_${timestampMs}"
+
+        val nestedCandidateObj = obj.optJSONObject("candidate")
+        val nestedSdpObj = obj.optJSONObject("sdp")
+        val candidate = nestedCandidateObj?.let { optStringFirst(it, "candidate", "sdp") }
+            ?: optStringFirst(obj, "candidate")
+        val sdp = nestedSdpObj?.let { optStringFirst(it, "sdp") }
+            ?: optStringFirst(obj, "sdp", "offer", "answer")
+        val sdpMid = optStringFirst(obj, "sdp_mid", "sdpMid", "mid")
+            ?: nestedCandidateObj?.let { optStringFirst(it, "sdp_mid", "sdpMid", "mid") }
+        val sdpMLineIndex = when {
+            obj.has("sdp_m_line_index") -> obj.optInt("sdp_m_line_index", 0)
+            obj.has("sdpMLineIndex") -> obj.optInt("sdpMLineIndex", 0)
+            nestedCandidateObj?.has("sdpMLineIndex") == true -> nestedCandidateObj.optInt("sdpMLineIndex", 0)
+            nestedCandidateObj?.has("sdp_m_line_index") == true -> nestedCandidateObj.optInt("sdp_m_line_index", 0)
+            else -> 0
+        }
+
+        val contentHash = "${sdp.orEmpty()}|${candidate.orEmpty()}|${sdpMid.orEmpty()}|$sdpMLineIndex".hashCode()
+        val explicitId = optStringFirst(obj, "signal_id", "signalId", "id")
+        val signalId = when {
+            !explicitId.isNullOrBlank() && normalizedType == "ice" -> "${explicitId}_${contentHash}"
+            !explicitId.isNullOrBlank() -> explicitId
+            else -> "${normalizedType}_${sender}_${receiver}_${timestampMs}_${contentHash}"
+        }
 
         return SignalingEnvelope(
             signalId = signalId,
@@ -139,15 +161,11 @@ object BackendJsonParser {
             sender = sender,
             senderName = optStringFirst(obj, "sender_name", "senderName", "caller_name"),
             receiver = receiver,
-            sdp = optStringFirst(obj, "sdp", "offer", "answer"),
+            sdp = sdp,
             isVideo = isVideo,
-            candidate = optStringFirst(obj, "candidate"),
-            sdpMid = optStringFirst(obj, "sdp_mid", "sdpMid"),
-            sdpMLineIndex = if (obj.has("sdp_m_line_index")) {
-                obj.optInt("sdp_m_line_index", 0)
-            } else {
-                obj.optInt("sdpMLineIndex", 0)
-            },
+            candidate = candidate,
+            sdpMid = sdpMid,
+            sdpMLineIndex = sdpMLineIndex,
             timestampMs = timestampMs
         )
     }
@@ -421,8 +439,36 @@ object BackendJsonParser {
         }
     }
 
+    fun parseSocialPosts(rawBody: String): List<SocialPost> {
+        val trimmed = rawBody.trim()
+        if (trimmed.isEmpty()) return emptyList()
+        val parsed = runCatching { JSONTokener(trimmed).nextValue() }.getOrNull() ?: return emptyList()
+        val out = mutableListOf<SocialPost>()
+        when (parsed) {
+            is JSONArray -> {
+                for (i in 0 until parsed.length()) {
+                    parsed.optJSONObject(i)?.let { parseSocialPostObject(it) }?.let { out.add(it) }
+                }
+            }
+            is JSONObject -> {
+                extractPostsFromContainer(parsed, out)
+                parsed.optJSONArray("data")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.let { parseSocialPostObject(it) }?.let { out.add(it) }
+                    }
+                }
+                parsed.optJSONObject("data")?.let { extractPostsFromContainer(it, out) }
+                parsed.optJSONObject("post")?.let { parseSocialPostObject(it) }?.let { out.add(it) }
+                if (out.isEmpty()) {
+                    parseSocialPostObject(parsed)?.let { out.add(it) }
+                }
+            }
+        }
+        return out.distinctBy { it.id }.sortedByDescending { it.timestampMs }
+    }
+
     private fun extractPostsFromContainer(root: JSONObject, posts: MutableList<SocialPost>) {
-        val keys = listOf("posts", "feed", "reels")
+        val keys = listOf("posts", "feed", "reels", "items")
         for (key in keys) {
             val arr = root.optJSONArray(key) ?: continue
             for (i in 0 until arr.length()) {
@@ -451,7 +497,8 @@ object BackendJsonParser {
             inlineImageBase64 = obj.optString("b64", ""),
             caption = obj.optString("caption", ""),
             shayariTag = obj.optString("shayari_tag", ""),
-            timestampMs = obj.optLong("timestamp_ms", System.currentTimeMillis()),
+            timestampMs = parseTimestampFirst(obj, "timestamp_ms", "timestampMs", "timestamp", "created_at")
+                ?: System.currentTimeMillis(),
             likeCount = obj.optInt("likes", 0),
             commentCount = obj.optInt("comments", 0),
             shareCount = obj.optInt("shares", 0),
@@ -695,7 +742,9 @@ object BackendJsonParser {
     private fun optStringFirst(obj: JSONObject, vararg keys: String): String? {
         for (key in keys) {
             if (obj.has(key) && !obj.isNull(key)) {
-                val value = obj.optString(key, "").trim()
+                val raw = obj.opt(key)
+                if (raw is JSONObject || raw is JSONArray) continue
+                val value = raw?.toString()?.trim().orEmpty()
                 if (value.isNotEmpty() && !value.equals("null", ignoreCase = true)) {
                     return value
                 }
